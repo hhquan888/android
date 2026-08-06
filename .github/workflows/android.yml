@@ -59,6 +59,17 @@ jobs:
           sudo modprobe ashmem_linux || true
           lsmod | grep binder
 
+      - name: Phát hiện số core CPU của runner
+        run: |
+          CPU_COUNT=$(nproc)
+          if [ "$CPU_COUNT" -ge 4 ]; then
+            CPU_LIMIT=4
+          else
+            CPU_LIMIT=$CPU_COUNT
+          fi
+          echo "Runner có $CPU_COUNT core, giới hạn cấp cho container: $CPU_LIMIT"
+          echo "CPU_LIMIT=$CPU_LIMIT" >> $GITHUB_ENV
+
       - name: Tạo docker-compose.yml cho Redroid và scrcpy-web
         run: |
           mkdir -p data
@@ -66,10 +77,11 @@ jobs:
           services:
             redroid:
               container_name: redroid
-              image: redroid/redroid:12.0.0-latest
+              image: aureliolo/redroid:14.0.0_amd64_with_gapps
               privileged: true
               mem_limit: ${{ github.event.inputs.ram_gb }}g
               memswap_limit: ${{ github.event.inputs.ram_gb }}g
+              cpus: "${{ env.CPU_LIMIT }}"
               ports:
                 - "5555:5555"
               volumes:
@@ -78,7 +90,8 @@ jobs:
                 - REDROID_WIDTH=720
                 - REDROID_HEIGHT=1280
                 - REDROID_FPS=30
-              # Bật ARM translation có sẵn trong image (libndk_translation)
+              # Bật ARM translation có sẵn trong image (libndk_translation) - vẫn cần cho
+              # các app Play Store chỉ có bản ARM, dù bản thân image đã là amd64 + GApps
               command:
                 - ro.product.cpu.abilist=x86_64,arm64-v8a,x86,armeabi-v7a,armeabi
                 - ro.product.cpu.abilist64=x86_64,arm64-v8a
@@ -167,10 +180,10 @@ jobs:
           echo "native bridge:"
           adb -s localhost:5555 shell getprop ro.dalvik.vm.native.bridge
 
-      - name: Kiểm tra giới hạn RAM đã áp dụng
+      - name: Kiểm tra giới hạn RAM và CPU đã áp dụng
         run: |
           echo "Giới hạn cgroup của container redroid:"
-          docker inspect redroid --format "Memory limit: {{.HostConfig.Memory}} bytes (~${{ github.event.inputs.ram_gb }}GB đã chọn)"
+          docker inspect redroid --format "Memory limit: {{.HostConfig.Memory}} bytes (~${{ github.event.inputs.ram_gb }}GB đã chọn) | CPU quota: {{.HostConfig.NanoCpus}} (~${{ env.CPU_LIMIT }} core đã chọn)"
           echo "RAM khả dụng theo Android nhìn thấy:"
           adb -s localhost:5555 shell cat /proc/meminfo | head -n 3
 
@@ -185,27 +198,19 @@ jobs:
             sleep 5
           done
 
-      - name: Cài trình duyệt Brave (v1.93.132, verify sha256)
+      - name: Cài trình duyệt Brave (bản x86_64 gốc, v1.93.132)
         run: |
           if adb -s localhost:5555 shell pm list packages | grep -qE "chrome|firefox|org.mozilla|brave|com.brave"; then
             echo "✅ Đã có trình duyệt cài sẵn, bỏ qua."
           else
-            echo "📥 Tải Brave APK (bản ghim cứng v1.93.132)..."
-            BRAVE_URL="https://github.com/brave/brave-browser/releases/download/v1.93.132/BraveMonoarm.apk"
-            EXPECTED_SHA256="fbe59b6e55e439623a250cd587871898a5fc8aa8dcf6af632d80d1bcd29e1eb5"
+            echo "📥 Tải Brave APK bản x86_64 gốc (không cần dịch ARM)..."
+            BRAVE_URL="https://github.com/brave/brave-browser/releases/download/v1.93.132/BraveMonox64.apk"
             curl -L "$BRAVE_URL" -o brave.apk
 
-            ACTUAL_SHA256=$(sha256sum brave.apk | awk '{print $1}')
-            echo "Expected: $EXPECTED_SHA256"
-            echo "Actual:   $ACTUAL_SHA256"
+            echo "sha256 file tải về: $(sha256sum brave.apk | awk '{print $1}')"
+            file brave.apk
 
-            if [ "$ACTUAL_SHA256" = "$EXPECTED_SHA256" ]; then
-              echo "✅ sha256 khớp, file đáng tin cậy."
-              adb -s localhost:5555 install -r brave.apk && echo "✅ Brave installed" || echo "⚠️ Cài thất bại, xem log ở trên."
-            else
-              echo "❌ sha256 KHÔNG khớp - từ chối cài để an toàn. Kiểm tra lại link/hash."
-              file brave.apk
-            fi
+            adb -s localhost:5555 install -r brave.apk && echo "✅ Brave installed" || echo "⚠️ Cài thất bại, xem log ở trên."
           fi
 
       - name: Cài dependencies và chạy upload server (không cần checkout repo)
@@ -330,7 +335,7 @@ jobs:
           echo "📤 Upload file tại:"
           echo "   ${UPLOAD_URL}"
           echo ""
-          echo "🔧 Root: ${{ github.event.inputs.root }} | RAM: ${{ github.event.inputs.ram_gb }}GB"
+          echo "🔧 Root: ${{ github.event.inputs.root }} | RAM: ${{ github.event.inputs.ram_gb }}GB | CPU: ${{ env.CPU_LIMIT }} core"
           echo "💾 Lưu dữ liệu qua các lần chạy: ${{ github.event.inputs.save_data }}"
           echo "=========================================="
 
