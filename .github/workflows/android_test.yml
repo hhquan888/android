@@ -1,4 +1,4 @@
-name: CloudPhone test
+name: CloudPhone giao diện đẹp hơn
 
 on:
   workflow_dispatch:
