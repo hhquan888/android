@@ -1,4 +1,4 @@
-name: CloudPhone Most stable, recommended
+name: CloudPhone với Redroid và scrcpy-web
 
 on:
   workflow_dispatch:
