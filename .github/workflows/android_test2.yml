@@ -73,11 +73,11 @@ jobs:
       - name: Tải bản ws-scrcpy custom đã build sẵn (hhquan888/ws-scrcpy)
         run: |
           mkdir -p ws-scrcpy-build
-          echo "📥 Tải ws-scrcpy-build.zip..."
-          curl -L "https://github.com/hhquan888/ws-scrcpy/releases/download/1.0/ws-scrcpy-build.zip" -o ws-scrcpy-build.zip
+          echo "📥 Tải ws-scrcpy-dist.zip..."
+          curl -L "https://github.com/hhquan888/ws-scrcpy/releases/download/1.0/ws-scrcpy-dist.zip" -o ws-scrcpy-dist.zip
 
-          EXPECTED_SHA256="033b6ab2c3c5d5f0a748afafbde842446eb8122aea769a0453b2e9cb79a631ae"
-          ACTUAL_SHA256=$(sha256sum ws-scrcpy-build.zip | awk '{print $1}')
+          EXPECTED_SHA256="5fedd7aa159a7696689cf943abc4c080518bab2b44d94cf5ebe3bf585a540d24"
+          ACTUAL_SHA256=$(sha256sum ws-scrcpy-dist.zip | awk '{print $1}')
           echo "Expected: $EXPECTED_SHA256"
           echo "Actual:   $ACTUAL_SHA256"
           if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
@@ -86,7 +86,7 @@ jobs:
           fi
           echo "✅ sha256 khớp."
 
-          unzip -o ws-scrcpy-build.zip -d ws-scrcpy-build
+          unzip -o ws-scrcpy-dist.zip -d ws-scrcpy-build
           echo "Cấu trúc sau khi giải nén:"
           find ws-scrcpy-build -maxdepth 2
 
