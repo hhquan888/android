@@ -1,4 +1,4 @@
-name: CloudPhone Beautiful interface, recommended.
+name: CloudPhone Most stable recommended
 
 on:
   workflow_dispatch:
@@ -32,7 +32,7 @@ on:
 
 jobs:
   cloudphone:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 350
     steps:
       - name: Khôi phục dữ liệu máy ảo lần chạy trước (nếu bật lưu)
@@ -111,7 +111,7 @@ jobs:
           services:
             redroid:
               container_name: redroid
-              image: aureliolo/redroid:14.0.0_amd64_with_gapps
+              image: aureliolo/redroid:14.0.0_arm64_with_gapps
               privileged: true
               mem_limit: ${{ github.event.inputs.ram_gb }}g
               memswap_limit: ${{ github.event.inputs.ram_gb }}g
@@ -124,16 +124,11 @@ jobs:
                 - REDROID_WIDTH=720
                 - REDROID_HEIGHT=1280
                 - REDROID_FPS=30
-              # Bật ARM translation có sẵn trong image (libndk_translation) - vẫn cần cho
-              # các app Play Store chỉ có bản ARM, dù bản thân image đã là amd64 + GApps
+              # Host là arm64, app ARM chạy native - không cần lớp dịch libndk_translation nữa
               command:
-                - ro.product.cpu.abilist=x86_64,arm64-v8a,x86,armeabi-v7a,armeabi
-                - ro.product.cpu.abilist64=x86_64,arm64-v8a
-                - ro.product.cpu.abilist32=x86,armeabi-v7a,armeabi
-                - ro.dalvik.vm.isa.arm=x86
-                - ro.dalvik.vm.isa.arm64=x86_64
-                - ro.enable.native.bridge.exec=1
-                - ro.dalvik.vm.native.bridge=libndk_translation.so
+                - ro.product.cpu.abilist=arm64-v8a,armeabi-v7a,armeabi
+                - ro.product.cpu.abilist64=arm64-v8a
+                - ro.product.cpu.abilist32=armeabi-v7a,armeabi
               restart: unless-stopped
 
             custom-ws-scrcpy:
@@ -210,12 +205,10 @@ jobs:
           echo "adb root state:"
           adb -s localhost:5555 shell whoami
 
-      - name: Kiểm tra ARM translation đã hoạt động chưa
+      - name: Kiểm tra abilist (arm64 chạy native, không qua lớp dịch)
         run: |
           echo "abilist hiện tại:"
           adb -s localhost:5555 shell getprop ro.product.cpu.abilist
-          echo "native bridge:"
-          adb -s localhost:5555 shell getprop ro.dalvik.vm.native.bridge
 
       - name: Kiểm tra giới hạn RAM và CPU đã áp dụng
         run: |
@@ -235,13 +228,13 @@ jobs:
             sleep 5
           done
 
-      - name: Cài trình duyệt Brave (bản x86_64 gốc, v1.93.132)
+      - name: Cài trình duyệt Brave (bản arm64 gốc, v1.93.132)
         run: |
           if adb -s localhost:5555 shell pm list packages | grep -qE "chrome|firefox|org.mozilla|brave|com.brave"; then
             echo "✅ Đã có trình duyệt cài sẵn, bỏ qua."
           else
-            echo "📥 Tải Brave APK bản x86_64 gốc (không cần dịch ARM)..."
-            BRAVE_URL="https://github.com/brave/brave-browser/releases/download/v1.93.132/BraveMonox64.apk"
+            echo "📥 Tải Brave APK bản arm64 gốc (chạy native trên host arm64)..."
+            BRAVE_URL="https://github.com/brave/brave-browser/releases/download/v1.93.132/Bravearm64Universal.apk"
             curl -L "$BRAVE_URL" -o brave.apk
 
             echo "sha256 file tải về: $(sha256sum brave.apk | awk '{print $1}')"
@@ -313,7 +306,7 @@ jobs:
 
       - name: Cài Cloudflare Tunnel (có watchdog tự reconnect)
         run: |
-          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64 -o cloudflared
           chmod +x cloudflared
           sudo mv cloudflared /usr/local/bin/
           pkill cloudflared || true
