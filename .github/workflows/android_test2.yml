@@ -1,4 +1,4 @@
-name: CloudPhone v3
+name: CloudPhone với Redroid và scrcpy-web
 
 on:
   workflow_dispatch:
@@ -40,9 +40,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: data
-          key: cloudphone-beta-data
+          key: cloudphone-alpha-data
           restore-keys: |
-            cloudphone-beta-data
+            cloudphone-alpha-data
 
       - name: Cài đặt công cụ cần thiết
         run: |
@@ -70,100 +70,111 @@ jobs:
           echo "Runner có $CPU_COUNT core, giới hạn cấp cho container: $CPU_LIMIT"
           echo "CPU_LIMIT=$CPU_LIMIT" >> $GITHUB_ENV
 
-      - name: Tạo Dockerfile cho scrcpy-web (bản fork hhquan888/ws-scrcpy)
+      - name: Tải bản ws-scrcpy custom đã build sẵn (hhquan888/ws-scrcpy)
         run: |
-          mkdir -p scrcpy-web-fork
-          cat > scrcpy-web-fork/Dockerfile <<'DOCKEREOF'
-FROM node:18-bookworm-slim
+          mkdir -p ws-scrcpy-build
+          echo "📥 Tải ws-scrcpy-build.zip..."
+          curl -L "https://github.com/hhquan888/ws-scrcpy/releases/download/1.0/ws-scrcpy-build.zip" -o ws-scrcpy-build.zip
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3 make g++ git ca-certificates curl unzip android-tools-adb \
-    && rm -rf /var/lib/apt/lists/*
+          EXPECTED_SHA256="033b6ab2c3c5d5f0a748afafbde842446eb8122aea769a0453b2e9cb79a631ae"
+          ACTUAL_SHA256=$(sha256sum ws-scrcpy-build.zip | awk '{print $1}')
+          echo "Expected: $EXPECTED_SHA256"
+          echo "Actual:   $ACTUAL_SHA256"
+          if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+            echo "❌ sha256 KHÔNG khớp - dừng lại để an toàn."
+            exit 1
+          fi
+          echo "✅ sha256 khớp."
 
-WORKDIR /app
+          unzip -o ws-scrcpy-build.zip -d ws-scrcpy-build
+          echo "Cấu trúc sau khi giải nén:"
+          find ws-scrcpy-build -maxdepth 2
 
-# Tải bản build sẵn (release 1.0) từ fork riêng của bạn
-RUN curl -fL -o /tmp/ws-scrcpy.zip \
-      "https://github.com/hhquan888/ws-scrcpy/releases/download/1.0/ws-scrcpy-build.zip" \
-    && unzip -q /tmp/ws-scrcpy.zip -d /app \
-    && rm /tmp/ws-scrcpy.zip
-
-RUN npm install --omit=dev
-
-EXPOSE 8000
-CMD ["npm", "start"]
-DOCKEREOF
+          # node-pty là native module (cần node-gyp biên dịch C++), nên bắt buộc có
+          # python3/make/g++ trong image build, không thể dùng node:18-slim trơn.
+          cat > ws-scrcpy-build/Dockerfile <<'DOCKERFILEEOF'
+          FROM node:18-slim
+          RUN apt-get update && \
+              apt-get install -y android-tools-adb curl python3 make g++ && \
+              rm -rf /var/lib/apt/lists/*
+          WORKDIR /app
+          COPY . .
+          RUN npm install --omit=dev --no-audit --no-fund
+          EXPOSE 8000
+          CMD ["npm", "start"]
+          DOCKERFILEEOF
 
       - name: Tạo docker-compose.yml cho Redroid và scrcpy-web
         run: |
           mkdir -p data
-          RAM_GB="${{ github.event.inputs.ram_gb }}"
-          cat > docker-compose.yml <<EOF
-services:
-  redroid:
-    container_name: redroid
-    image: aureliolo/redroid:14.0.0_amd64_with_gapps
-    privileged: true
-    mem_limit: ${RAM_GB}g
-    memswap_limit: ${RAM_GB}g
-    cpus: "$CPU_LIMIT"
-    ports:
-      - "5555:5555"
-    volumes:
-      - ./data:/data
-    environment:
-      - REDROID_WIDTH=720
-      - REDROID_HEIGHT=1280
-      - REDROID_FPS=30
-    # Bật ARM translation có sẵn trong image (libndk_translation) - vẫn cần cho
-    # các app Play Store chỉ có bản ARM, dù bản thân image đã là amd64 + GApps
-    command:
-      - ro.product.cpu.abilist=x86_64,arm64-v8a,x86,armeabi-v7a,armeabi
-      - ro.product.cpu.abilist64=x86_64,arm64-v8a
-      - ro.product.cpu.abilist32=x86,armeabi-v7a,armeabi
-      - ro.dalvik.vm.isa.arm=x86
-      - ro.dalvik.vm.isa.arm64=x86_64
-      - ro.enable.native.bridge.exec=1
-      - ro.dalvik.vm.native.bridge=libndk_translation.so
-    restart: unless-stopped
+          cat > docker-compose.yml <<'EOF'
+          services:
+            redroid:
+              container_name: redroid
+              image: aureliolo/redroid:14.0.0_amd64_with_gapps
+              privileged: true
+              mem_limit: ${{ github.event.inputs.ram_gb }}g
+              memswap_limit: ${{ github.event.inputs.ram_gb }}g
+              cpus: "${{ env.CPU_LIMIT }}"
+              ports:
+                - "5555:5555"
+              volumes:
+                - ./data:/data
+              environment:
+                - REDROID_WIDTH=720
+                - REDROID_HEIGHT=1280
+                - REDROID_FPS=30
+              # Bật ARM translation có sẵn trong image (libndk_translation) - vẫn cần cho
+              # các app Play Store chỉ có bản ARM, dù bản thân image đã là amd64 + GApps
+              command:
+                - ro.product.cpu.abilist=x86_64,arm64-v8a,x86,armeabi-v7a,armeabi
+                - ro.product.cpu.abilist64=x86_64,arm64-v8a
+                - ro.product.cpu.abilist32=x86,armeabi-v7a,armeabi
+                - ro.dalvik.vm.isa.arm=x86
+                - ro.dalvik.vm.isa.arm64=x86_64
+                - ro.enable.native.bridge.exec=1
+                - ro.dalvik.vm.native.bridge=libndk_translation.so
+              restart: unless-stopped
 
-  scrcpy-web:
-    container_name: scrcpy-web
-    build:
-      context: ./scrcpy-web-fork
-    privileged: true
-    ports:
-      - "8000:8000"
-    depends_on:
-      - redroid
-    restart: unless-stopped
-    command: >
-      sh -c "
-        adb start-server &&
-        echo 'Cho Redroid + ket noi adb lan dau...' &&
-        for i in \$(seq 1 30); do adb connect redroid:5555 | grep -q connected && break; echo 'retry adb connect...'; sleep 5; done &&
-        ( while true; do
-            sleep 10;
-            adb devices | grep -q 'redroid:5555.*device' || { echo 'adb mat ket noi, thu reconnect...'; adb connect redroid:5555; };
-          done ) &
-        echo 'Start scrcpy-web...' &&
-        npm start
-      "
-EOF
+            custom-ws-scrcpy:
+              container_name: custom-ws-scrcpy
+              build:
+                context: ./ws-scrcpy-build
+                dockerfile: Dockerfile
+              image: custom-ws-scrcpy:latest
+              privileged: true
+              ports:
+                - "8000:8000"
+              depends_on:
+                - redroid
+              restart: unless-stopped
+              command: >
+                sh -c "
+                  adb start-server &&
+                  echo 'Cho Redroid + ket noi adb lan dau...' &&
+                  for i in $(seq 1 30); do adb connect redroid:5555 | grep -q connected && break; echo 'retry adb connect...'; sleep 5; done &&
+                  ( while true; do
+                      sleep 10;
+                      adb devices | grep -q 'redroid:5555.*device' || { echo 'adb mat ket noi, thu reconnect...'; adb connect redroid:5555; };
+                    done ) &
+                  echo 'Start custom-ws-scrcpy...' &&
+                  npm start
+                "
+          EOF
 
       - name: Khởi chạy Redroid và scrcpy-web
         run: |
-          docker-compose up -d --build
+          docker-compose up -d
           echo "Đợi các container khởi động..."
           sleep 30
           docker ps -a
 
       - name: "[CHẨN ĐOÁN] Log của tất cả container đang chạy"
         run: |
-          for cname in $(docker ps -a --format '{{.Names}}'); do
-            echo "===================== docker logs $cname ====================="
-            docker logs "$cname" 2>&1 | tail -n 100
-            docker inspect "$cname" --format "$cname state: {{.State.Status}} (restarts: {{.RestartCount}})"
+          for name in $(docker ps -a --format '{{.Names}}'); do
+            echo "===================== docker logs $name ====================="
+            docker logs "$name" 2>&1 | tail -n 100
+            docker inspect "$name" --format "$name state: {{.State.Status}} (restarts: {{.RestartCount}})"
             echo ""
           done
 
@@ -247,48 +258,48 @@ EOF
           npm init -y >/dev/null 2>&1
           npm install express multer >/dev/null 2>&1
           cat > server.js <<'JSEOF'
-const express = require('express');
-const multer = require('multer');
-const { execFile } = require('child_process');
-const path = require('path');
+          const express = require('express');
+          const multer = require('multer');
+          const { execFile } = require('child_process');
+          const path = require('path');
 
-const app = express();
-const upload = multer({ dest: path.join(__dirname, '../uploads') });
+          const app = express();
+          const upload = multer({ dest: path.join(__dirname, '../uploads') });
 
-app.get('/', (req, res) => {
-  res.send(`
-    <html><body style="font-family:sans-serif;padding:20px">
-    <h2>📤 Upload file vào máy ảo Android</h2>
-    <form method="POST" action="/upload" enctype="multipart/form-data">
-      <input type="file" name="files" multiple />
-      <button type="submit">Upload</button>
-    </form>
-    </body></html>
-  `);
-});
+          app.get('/', (req, res) => {
+            res.send(`
+              <html><body style="font-family:sans-serif;padding:20px">
+              <h2>📤 Upload file vào máy ảo Android</h2>
+              <form method="POST" action="/upload" enctype="multipart/form-data">
+                <input type="file" name="files" multiple />
+                <button type="submit">Upload</button>
+              </form>
+              </body></html>
+            `);
+          });
 
-app.post('/upload', upload.array('files'), (req, res) => {
-  const files = req.files || [];
-  if (files.length === 0) return res.json({ success: false, message: 'Không có file nào' });
+          app.post('/upload', upload.array('files'), (req, res) => {
+            const files = req.files || [];
+            if (files.length === 0) return res.json({ success: false, message: 'Không có file nào' });
 
-  let done = 0;
-  const results = [];
-  files.forEach((f) => {
-    const dest = '/sdcard/Download/' + f.originalname;
-    execFile('adb', ['-s', 'localhost:5555', 'push', f.path, dest], (err) => {
-      results.push({ file: f.originalname, success: !err, error: err ? err.message : null });
-      done++;
-      if (done === files.length) {
-        res.json({ success: results.every(r => r.success), results });
-      }
-    });
-  });
-});
+            let done = 0;
+            const results = [];
+            files.forEach((f) => {
+              const dest = '/sdcard/Download/' + f.originalname;
+              execFile('adb', ['-s', 'localhost:5555', 'push', f.path, dest], (err) => {
+                results.push({ file: f.originalname, success: !err, error: err ? err.message : null });
+                done++;
+                if (done === files.length) {
+                  res.json({ success: results.every(r => r.success), results });
+                }
+              });
+            });
+          });
 
-app.get('/list', (req, res) => res.json({ status: 'ok' }));
+          app.get('/list', (req, res) => res.json({ status: 'ok' }));
 
-app.listen(3000, () => console.log('Upload server chạy tại port 3000'));
-JSEOF
+          app.listen(3000, () => console.log('Upload server chạy tại port 3000'));
+          JSEOF
           cd ..
           nohup node upload-server/server.js > upload-server.log 2>&1 &
           disown
