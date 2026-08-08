@@ -3,42 +3,44 @@ name: CloudPhone với Redroid và scrcpy-web
 on:
   workflow_dispatch:
     inputs:
-      arch:
-        description: 'Kiến trúc runner/host (quyết định runner GitHub + image Redroid đúng arch)'
-        required: true
-        default: 'arm64'
-        type: choice
-        options:
-          - 'arm64'
-          - 'amd64'
       android_version:
-        description: 'Phiên bản Android cho Redroid'
+        description: 'Phiên bản Android'
         required: true
-        default: '11.0.0'
+        default: '12'
         type: choice
         options:
-          - '10.0.0'
-          - '11.0.0'
-          - '12.0.0'
-          - '13.0.0'
-      gapps_type:
-        description: 'Loại Google Apps cần cài (để có CH Play). none = AOSP thuần, không Play Store'
+          - '9'
+          - '10'
+          - '11'
+          - '12'
+
+      gapps:
+        description: 'Cài Google Play (GApps)?'
         required: true
-        default: 'opengapps'
+        default: 'y'
         type: choice
         options:
-          - 'opengapps'
-          - 'mindthegapps'
-          - 'litegapps'
-          - 'none'
+          - 'y'
+          - 'n'
+
       root:
-        description: 'Bật root? (Magisk trong image + adb root/remount lúc chạy)'
+        description: 'Bật root (Magisk/su)?'
         required: true
-        default: '1'
+        default: '0'
         type: choice
         options:
-          - '0'
-          - '1'
+          - '0'   # No root
+          - '1'   # Root
+
+      arch:
+        description: 'Kiến trúc runner (arm64 = nhanh hơn nếu bạn có, amd64 = phổ thông nhất)'
+        required: true
+        default: 'amd64'
+        type: choice
+        options:
+          - 'amd64'
+          - 'arm64'
+
       ram_gb:
         description: 'Giới hạn RAM cho máy ảo (GB)'
         required: true
@@ -49,6 +51,7 @@ on:
           - '4'
           - '8'
           - '12'
+
       save_data:
         description: 'Lưu dữ liệu máy ảo qua các lần chạy? y = lưu, n = luôn làm mới'
         required: true
@@ -60,33 +63,125 @@ on:
 
 jobs:
   cloudphone:
-    runs-on: ${{ github.event.inputs.arch == 'amd64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
+    # Tự động chọn runner theo input arch
+    runs-on: ${{ github.event.inputs.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 350
+
     steps:
-      - name: Khôi phục dữ liệu máy ảo lần chạy trước (nếu bật lưu, khớp đúng arch/version/gapps/root)
+      # ─────────────────────────────────────────────
+      # 0. Tính toán image Redroid và các biến arch
+      # ─────────────────────────────────────────────
+      - name: Tính toán image Redroid + biến kiến trúc
+        run: |
+          ANDROID_VER="${{ github.event.inputs.android_version }}"
+          GAPPS="${{ github.event.inputs.gapps }}"
+          ROOT="${{ github.event.inputs.root }}"
+          ARCH="${{ github.event.inputs.arch }}"
+
+          # ── Chọn image tag ──
+          # furtif/redroid hỗ trợ 4 variant per version:
+          #   <ver>          → AOSP, no root
+          #   <ver>-gapps    → GApps, no root  (chỉ có từ Android 11+)
+          #   <ver>-rooted   → AOSP, root
+          #   <ver>-rooted-gapps → GApps + root
+          #
+          # Android 9/10 không có tag -gapps riêng trên furtif,
+          # dùng rooted-gapps rồi bỏ qua bước adb root nếu root=0.
+
+          if [ "$GAPPS" = "y" ] && [ "$ROOT" = "1" ]; then
+            IMAGE_TAG="furtif/redroid:${ANDROID_VER}.0.0-rooted-gapps"
+          elif [ "$GAPPS" = "y" ] && [ "$ROOT" = "0" ]; then
+            # Android 11+ có tag -gapps thuần; 9/10 dùng rooted-gapps + không chạy adb root
+            if [ "$ANDROID_VER" -ge 11 ]; then
+              IMAGE_TAG="furtif/redroid:${ANDROID_VER}.0.0-gapps"
+            else
+              IMAGE_TAG="furtif/redroid:${ANDROID_VER}.0.0-rooted-gapps"
+            fi
+          elif [ "$GAPPS" = "n" ] && [ "$ROOT" = "1" ]; then
+            IMAGE_TAG="furtif/redroid:${ANDROID_VER}.0.0-rooted"
+          else
+            IMAGE_TAG="furtif/redroid:${ANDROID_VER}.0.0"
+          fi
+
+          # ── ABI list theo arch ──
+          if [ "$ARCH" = "arm64" ]; then
+            # Host ARM64 → app ARM chạy native, không cần lớp dịch x86
+            ABILIST="arm64-v8a,armeabi-v7a,armeabi"
+            ABILIST64="arm64-v8a"
+            ABILIST32="armeabi-v7a,armeabi"
+            # Không cần libndk/houdini trên arm64
+            NDK_TRANSLATION=""
+          else
+            # Host AMD64 (x86_64) → cần lớp dịch ARM→x86 qua libndk_translation
+            ABILIST="x86_64,x86,arm64-v8a,armeabi-v7a,armeabi"
+            ABILIST64="x86_64,arm64-v8a"
+            ABILIST32="x86,armeabi-v7a,armeabi"
+            # Bật libndk_translation để app ARM chạy được trên host x86
+            NDK_TRANSLATION="ro.dalvik.vm.native.bridge=libndk_translation.so"
+          fi
+
+          # ── cloudflared binary theo arch ──
+          if [ "$ARCH" = "arm64" ]; then
+            CLOUDFLARED_BIN="cloudflared-linux-arm64"
+          else
+            CLOUDFLARED_BIN="cloudflared-linux-amd64"
+          fi
+
+          # ── Xuất tất cả ra GITHUB_ENV ──
+          echo "IMAGE_TAG=$IMAGE_TAG"             >> $GITHUB_ENV
+          echo "ABILIST=$ABILIST"                 >> $GITHUB_ENV
+          echo "ABILIST64=$ABILIST64"             >> $GITHUB_ENV
+          echo "ABILIST32=$ABILIST32"             >> $GITHUB_ENV
+          echo "NDK_TRANSLATION=$NDK_TRANSLATION" >> $GITHUB_ENV
+          echo "CLOUDFLARED_BIN=$CLOUDFLARED_BIN" >> $GITHUB_ENV
+
+          echo "✅ Image:        $IMAGE_TAG"
+          echo "✅ ABI list:     $ABILIST"
+          echo "✅ cloudflared:  $CLOUDFLARED_BIN"
+          echo "✅ NDK bridge:   ${NDK_TRANSLATION:-'(không cần — host arm64)'}"
+
+      # ─────────────────────────────────────────────
+      # 1. Cache dữ liệu máy ảo
+      # ─────────────────────────────────────────────
+      - name: Khôi phục dữ liệu máy ảo lần chạy trước (nếu bật lưu)
         if: ${{ github.event.inputs.save_data == 'y' }}
         uses: actions/cache@v4
         with:
           path: data
-          key: cloudphone-alpha-data-${{ github.event.inputs.arch }}-${{ github.event.inputs.android_version }}-${{ github.event.inputs.gapps_type }}-root${{ github.event.inputs.root }}
+          key: cloudphone-alpha-data-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.arch }}
           restore-keys: |
-            cloudphone-alpha-data-${{ github.event.inputs.arch }}-${{ github.event.inputs.android_version }}-${{ github.event.inputs.gapps_type }}-root${{ github.event.inputs.root }}
+            cloudphone-alpha-data-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.arch }}
 
+      # ─────────────────────────────────────────────
+      # 2. Cài công cụ
+      # ─────────────────────────────────────────────
       - name: Cài đặt công cụ cần thiết
         run: |
           sudo apt-get update
-          sudo apt-get install -y android-tools-adb curl lzip python3-venv python3-pip git
-          sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+          sudo apt-get install -y android-tools-adb curl
+          sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" \
+            -o /usr/local/bin/docker-compose
           sudo chmod +x /usr/local/bin/docker-compose
           docker-compose --version
 
+      # ─────────────────────────────────────────────
+      # 3. Kernel modules (binder / ashmem)
+      # ─────────────────────────────────────────────
       - name: Tải module kernel binder (cần cho Redroid)
         run: |
-          sudo apt-get install -y linux-modules-extra-$(uname -r) || true
-          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder"
+          # Thử cài linux-modules-extra, bỏ qua nếu không có
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
+          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder" || {
+            echo "⚠️ binder_linux không load được, thử binderfs..."
+            sudo modprobe binderfs || echo "⚠️ binderfs cũng không load được — Redroid có thể không khởi động"
+          }
           sudo modprobe ashmem_linux || true
-          lsmod | grep binder
+          echo "Modules đang load:"
+          lsmod | grep -E "binder|ashmem" || echo "(không có module nào khớp)"
 
+      # ─────────────────────────────────────────────
+      # 4. CPU limit
+      # ─────────────────────────────────────────────
       - name: Phát hiện số core CPU của runner
         run: |
           CPU_COUNT=$(nproc)
@@ -98,105 +193,22 @@ jobs:
           echo "Runner có $CPU_COUNT core, giới hạn cấp cho container: $CPU_LIMIT"
           echo "CPU_LIMIT=$CPU_LIMIT" >> $GITHUB_ENV
 
-      - name: Build ảnh Redroid tuỳ chỉnh (GApps/Magisk/libndk) bằng redroid-script
-        run: |
-          ANDROID_VERSION="${{ github.event.inputs.android_version }}"
-          GAPPS_TYPE="${{ github.event.inputs.gapps_type }}"
-          ROOT="${{ github.event.inputs.root }}"
-          ARCH="${{ github.event.inputs.arch }}"
-
-          git clone https://github.com/ayasa520/redroid-script.git
-          cd redroid-script
-          python3 -m venv venv
-          venv/bin/pip install -r requirements.txt
-
-          FLAGS=""
-          case "$GAPPS_TYPE" in
-            opengapps) FLAGS="${FLAGS} -g" ;;
-            mindthegapps) FLAGS="${FLAGS} -mtg" ;;
-            litegapps) FLAGS="${FLAGS} -lg" ;;
-            none) : ;;
-            *) echo "::error::gapps_type không hợp lệ: $GAPPS_TYPE"; exit 1 ;;
-          esac
-          # root=1 -> nhúng Magisk vào image để app xin được su thật, không chỉ adb root
-          if [ "$ROOT" = "1" ]; then
-            FLAGS="${FLAGS} -m"
-          fi
-          # amd64 (x86_64) cần lớp dịch libndk để chạy được app chỉ build cho ARM
-          if [ "$ARCH" = "amd64" ]; then
-            FLAGS="${FLAGS} -n"
-          fi
-
-          echo "▶️ Chạy: python3 redroid.py -a $ANDROID_VERSION $FLAGS"
-          set +e
-          if [ -z "$FLAGS" ]; then
-            timeout 2700 sudo venv/bin/python3 redroid.py -a "$ANDROID_VERSION"
-          else
-            timeout 2700 sudo venv/bin/python3 redroid.py -a "$ANDROID_VERSION" $FLAGS
-          fi
-          BUILD_RC=$?
-          set -e
-          if [ $BUILD_RC -ne 0 ]; then
-            echo "::warning::redroid-script kết thúc với mã lỗi $BUILD_RC, sẽ thử fallback bên dưới nếu không tìm được image."
-          fi
-
-          echo "Danh sách image redroid/redroid hiện có trên máy:"
-          docker images redroid/redroid || true
-
-          REDROID_IMAGE=$(docker images --format '{{.Repository}}:{{.Tag}}###{{.CreatedAt}}' \
-            | grep "^redroid/redroid:${ANDROID_VERSION}-" \
-            | sort -t'#' -k4 -r | head -n1 | cut -d'#' -f1)
-
-          if [ -z "$REDROID_IMAGE" ]; then
-            echo "::warning::Không tìm thấy image tuỳ chỉnh khớp ${ANDROID_VERSION}-*, fallback về image gốc redroid/redroid:${ANDROID_VERSION}-latest (KHÔNG có GApps/Magisk)."
-            REDROID_IMAGE="redroid/redroid:${ANDROID_VERSION}-latest"
-            docker pull "$REDROID_IMAGE"
-          fi
-
-          echo "✅ Sẽ dùng image: $REDROID_IMAGE"
-          echo "REDROID_IMAGE=$REDROID_IMAGE" >> $GITHUB_ENV
-
-          # Chuẩn bị bộ command/props ABI phù hợp arch, ghi dạng multi-line vào GITHUB_ENV
-          if [ "$ARCH" = "amd64" ]; then
-            {
-              echo "REDROID_PROPS<<PROPSEOF"
-              echo "      command:"
-              echo "        - androidboot.use_memfd=1"
-              echo "        - ro.product.cpu.abilist=x86_64,arm64-v8a,x86,armeabi-v7a,armeabi"
-              echo "        - ro.product.cpu.abilist64=x86_64,arm64-v8a"
-              echo "        - ro.product.cpu.abilist32=x86,armeabi-v7a,armeabi"
-              echo "        - ro.dalvik.vm.isa.arm=x86"
-              echo "        - ro.dalvik.vm.isa.arm64=x86_64"
-              echo "        - ro.enable.native.bridge.exec=1"
-              echo "        - ro.vendor.enable.native.bridge.exec=1"
-              echo "        - ro.vendor.enable.native.bridge.exec64=1"
-              echo "        - ro.dalvik.vm.native.bridge=libndk_translation.so"
-              echo "        - ro.ndk_translation.version=0.2.3"
-              echo "PROPSEOF"
-            } >> $GITHUB_ENV
-          else
-            {
-              echo "REDROID_PROPS<<PROPSEOF"
-              echo "      command:"
-              echo "        - ro.product.cpu.abilist=arm64-v8a,armeabi-v7a,armeabi"
-              echo "        - ro.product.cpu.abilist64=arm64-v8a"
-              echo "        - ro.product.cpu.abilist32=armeabi-v7a,armeabi"
-              echo "PROPSEOF"
-            } >> $GITHUB_ENV
-          fi
-
+      # ─────────────────────────────────────────────
+      # 5. Build ws-scrcpy
+      # ─────────────────────────────────────────────
       - name: Tải bản ws-scrcpy custom đã build sẵn (hhquan888/ws-scrcpy)
         run: |
           mkdir -p ws-scrcpy-build
           echo "📥 Tải ws-scrcpy-dist.zip..."
-          curl -L "https://github.com/hhquan888/ws-scrcpy/releases/download/1.0/ws-scrcpy-dist.zip" -o ws-scrcpy-dist.zip
+          curl -L "https://github.com/hhquan888/ws-scrcpy/releases/download/1.0/ws-scrcpy-dist.zip" \
+            -o ws-scrcpy-dist.zip
 
           EXPECTED_SHA256="5fedd7aa159a7696689cf943abc4c080518bab2b44d94cf5ebe3bf585a540d24"
           ACTUAL_SHA256=$(sha256sum ws-scrcpy-dist.zip | awk '{print $1}')
           echo "Expected: $EXPECTED_SHA256"
           echo "Actual:   $ACTUAL_SHA256"
           if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
-            echo "❌ sha256 KHÔNG khớp - dừng lại để an toàn."
+            echo "❌ sha256 KHÔNG khớp — dừng lại để an toàn."
             exit 1
           fi
           echo "✅ sha256 khớp."
@@ -205,227 +217,287 @@ jobs:
           echo "Cấu trúc sau khi giải nén:"
           find ws-scrcpy-build -maxdepth 2
 
-          # node-pty là native module (cần node-gyp biên dịch C++), nên bắt buộc có
-          # python3/make/g++ trong image build, không thể dùng node:18-slim trơn.
+          # node-pty là native module → cần python3/make/g++ để biên dịch C++
           cat > ws-scrcpy-build/Dockerfile <<'DOCKERFILEEOF'
-          FROM node:18-slim
-          RUN apt-get update && \
-              apt-get install -y android-tools-adb curl python3 make g++ && \
-              rm -rf /var/lib/apt/lists/*
-          WORKDIR /app
-          COPY . .
-          RUN npm install --omit=dev --no-audit --no-fund
-          EXPOSE 8000
-          CMD ["npm", "start"]
-          DOCKERFILEEOF
+FROM node:18-slim
+RUN apt-get update && \
+    apt-get install -y android-tools-adb curl python3 make g++ && \
+    rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY . .
+RUN npm install --omit=dev --no-audit --no-fund
+EXPOSE 8000
+CMD ["npm", "start"]
+DOCKERFILEEOF
 
+      # ─────────────────────────────────────────────
+      # 6. docker-compose.yml
+      #    Dùng env vars đã tính ở step 0
+      # ─────────────────────────────────────────────
       - name: Tạo docker-compose.yml cho Redroid và scrcpy-web
         run: |
           mkdir -p data
-          cat > docker-compose.yml <<EOF
-          services:
-            redroid:
-              container_name: redroid
-              image: ${{ env.REDROID_IMAGE }}
-              privileged: true
-              mem_limit: ${{ github.event.inputs.ram_gb }}g
-              memswap_limit: ${{ github.event.inputs.ram_gb }}g
-              cpus: "${{ env.CPU_LIMIT }}"
-              ports:
-                - "5555:5555"
-              volumes:
-                - ./data:/data
-              environment:
-                - REDROID_WIDTH=720
-                - REDROID_HEIGHT=1280
-                - REDROID_FPS=30
-          ${{ env.REDROID_PROPS }}
-              restart: unless-stopped
 
-            custom-ws-scrcpy:
-              container_name: custom-ws-scrcpy
-              build:
-                context: ./ws-scrcpy-build
-                dockerfile: Dockerfile
-              image: custom-ws-scrcpy:latest
-              privileged: true
-              ports:
-                - "8000:8000"
-              depends_on:
-                - redroid
-              restart: unless-stopped
-              command: >
-                sh -c "
-                  adb start-server &&
-                  echo 'Cho Redroid + ket noi adb lan dau...' &&
-                  for i in $(seq 1 30); do adb connect redroid:5555 | grep -q connected && break; echo 'retry adb connect...'; sleep 5; done &&
-                  ( while true; do
-                      sleep 10;
-                      adb devices | grep -q 'redroid:5555.*device' || { echo 'adb mat ket noi, thu reconnect...'; adb connect redroid:5555; };
-                    done ) &
-                  echo 'Start custom-ws-scrcpy...' &&
-                  npm start
-                "
-          EOF
-          echo "----- docker-compose.yml -----"
+          # Build dòng command Redroid — thêm NDK bridge nếu chạy trên amd64
+          NDK_LINE=""
+          if [ -n "$NDK_TRANSLATION" ]; then
+            NDK_LINE="                - ${NDK_TRANSLATION}"
+          fi
+
+          cat > docker-compose.yml <<COMPOSEEOF
+services:
+  redroid:
+    container_name: redroid
+    image: ${IMAGE_TAG}
+    privileged: true
+    mem_limit: ${{ github.event.inputs.ram_gb }}g
+    memswap_limit: ${{ github.event.inputs.ram_gb }}g
+    cpus: "${CPU_LIMIT}"
+    ports:
+      - "5555:5555"
+    volumes:
+      - ./data:/data
+    environment:
+      - REDROID_WIDTH=720
+      - REDROID_HEIGHT=1280
+      - REDROID_FPS=30
+    command:
+      - ro.product.cpu.abilist=${ABILIST}
+      - ro.product.cpu.abilist64=${ABILIST64}
+      - ro.product.cpu.abilist32=${ABILIST32}
+$([ -n "$NDK_TRANSLATION" ] && echo "      - ${NDK_TRANSLATION}" || true)
+    restart: unless-stopped
+
+  custom-ws-scrcpy:
+    container_name: custom-ws-scrcpy
+    build:
+      context: ./ws-scrcpy-build
+      dockerfile: Dockerfile
+    image: custom-ws-scrcpy:latest
+    privileged: true
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redroid
+    restart: unless-stopped
+    command: >
+      sh -c "
+        adb start-server &&
+        echo 'Cho Redroid khởi động + kết nối ADB lần đầu...' &&
+        for i in \$(seq 1 30); do
+          adb connect redroid:5555 | grep -q connected && break
+          echo 'retry adb connect...'
+          sleep 5
+        done &&
+        ( while true; do
+            sleep 10
+            adb devices | grep -q 'redroid:5555.*device' || {
+              echo 'ADB mất kết nối, reconnect...'
+              adb connect redroid:5555
+            }
+          done ) &
+        echo 'Khởi động custom-ws-scrcpy...' &&
+        npm start
+      "
+COMPOSEEOF
+
+          echo "=== docker-compose.yml ==="
           cat docker-compose.yml
 
+      # ─────────────────────────────────────────────
+      # 7. Khởi chạy containers
+      # ─────────────────────────────────────────────
       - name: Khởi chạy Redroid và scrcpy-web
         run: |
           docker-compose up -d
-          echo "Đợi các container khởi động..."
+          echo "Đợi các container khởi động (30s)..."
           sleep 30
           docker ps -a
 
-      - name: "[CHẨN ĐOÁN] Log của tất cả container đang chạy"
+      - name: "[CHẨN ĐOÁN] Log tất cả container"
         run: |
           for name in $(docker ps -a --format '{{.Names}}'); do
             echo "===================== docker logs $name ====================="
             docker logs "$name" 2>&1 | tail -n 100
-            docker inspect "$name" --format "$name state: {{.State.Status}} (restarts: {{.RestartCount}})"
+            docker inspect "$name" \
+              --format "$name state: {{.State.Status}} (restarts: {{.RestartCount}})"
             echo ""
           done
 
+      # ─────────────────────────────────────────────
+      # 8. Chờ Android boot
+      # ─────────────────────────────────────────────
       - name: Kiểm tra ADB kết nối và boot hoàn tất
         run: |
           adb connect localhost:5555 || true
           adb devices -l
 
           echo "Chờ Android boot hoàn tất (kiểm tra sys.boot_completed)..."
-          for i in $(seq 1 30); do
+          for i in $(seq 1 36); do
             BOOTED=$(adb -s localhost:5555 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
             if [ "$BOOTED" = "1" ]; then
               echo "✅ Android đã boot xong!"
               break
             fi
-            echo "Đợi boot... ($i/30)"
+            echo "Đợi boot... ($i/36)"
             sleep 10
           done
 
-          STATE=$(adb -s localhost:5555 get-state 2>/dev/null)
+          STATE=$(adb -s localhost:5555 get-state 2>/dev/null || echo "unknown")
           echo "ADB state: $STATE"
           if [ "$STATE" != "device" ]; then
             echo "::warning::ADB chưa ở trạng thái device, tiếp tục..."
           fi
 
+      # ─────────────────────────────────────────────
+      # 9. Root (chỉ khi root=1)
+      # ─────────────────────────────────────────────
       - name: Bật root (nếu chọn root=1)
         if: ${{ github.event.inputs.root == '1' }}
         run: |
           adb -s localhost:5555 root
           sleep 3
           adb connect localhost:5555 || true
-          adb -s localhost:5555 remount || echo "⚠️ Remount thất bại (bình thường nếu image không cho remount system)"
-          echo "adb root state:"
+          adb -s localhost:5555 remount \
+            || echo "⚠️ remount thất bại (bình thường nếu image không cho remount system)"
+          echo "whoami sau khi root:"
           adb -s localhost:5555 shell whoami
-          echo "Kiểm tra Magisk (root cho app) đã có trong image chưa:"
-          adb -s localhost:5555 shell pm list packages | grep -i magisk || echo "⚠️ Không thấy gói Magisk, kiểm tra lại log bước build image."
 
-      - name: Kiểm tra Google Play / GApps đã cài thành công chưa
-        if: ${{ github.event.inputs.gapps_type != 'none' }}
+      # ─────────────────────────────────────────────
+      # 10. Chẩn đoán ABI + RAM/CPU
+      # ─────────────────────────────────────────────
+      - name: Kiểm tra abilist và thông tin hệ thống
         run: |
-          echo "Kiểm tra Play Store (com.android.vending)..."
-          if adb -s localhost:5555 shell pm list packages | grep -q com.android.vending; then
-            echo "✅ Đã có Play Store."
-          else
-            echo "::warning::Không thấy com.android.vending - GApps có thể chưa cài đúng. Xem lại log bước 'Build ảnh Redroid tuỳ chỉnh'."
-          fi
-          echo "Danh sách gói google.*:"
-          adb -s localhost:5555 shell pm list packages | grep -i google || true
-
-      - name: Kiểm tra abilist (đối chiếu với arch đã chọn: ${{ github.event.inputs.arch }})
-        run: |
-          echo "abilist hiện tại:"
+          echo "=== ABI list ==="
           adb -s localhost:5555 shell getprop ro.product.cpu.abilist
-          adb -s localhost:5555 shell getprop ro.product.cpu.abilist64
-          adb -s localhost:5555 shell getprop ro.product.cpu.abilist32
+          echo "=== Android version ==="
+          adb -s localhost:5555 shell getprop ro.build.version.release
+          echo "=== NDK bridge ==="
+          adb -s localhost:5555 shell getprop ro.dalvik.vm.native.bridge || echo "(không có)"
+          echo "=== RAM theo Android ==="
+          adb -s localhost:5555 shell cat /proc/meminfo | head -n 3
 
       - name: Kiểm tra giới hạn RAM và CPU đã áp dụng
         run: |
-          echo "Giới hạn cgroup của container redroid:"
-          docker inspect redroid --format "Memory limit: {{.HostConfig.Memory}} bytes (~${{ github.event.inputs.ram_gb }}GB đã chọn) | CPU quota: {{.HostConfig.NanoCpus}} (~${{ env.CPU_LIMIT }} core đã chọn)"
-          echo "RAM khả dụng theo Android nhìn thấy:"
-          adb -s localhost:5555 shell cat /proc/meminfo | head -n 3
+          docker inspect redroid \
+            --format "Memory: {{.HostConfig.Memory}} bytes | CPUs: {{.HostConfig.NanoCpus}} nanocpus"
 
+      # ─────────────────────────────────────────────
+      # 11. Kiểm tra GApps / Google Play
+      # ─────────────────────────────────────────────
+      - name: Kiểm tra Google Play Store
+        run: |
+          if adb -s localhost:5555 shell pm list packages 2>/dev/null | grep -q "com.android.vending"; then
+            echo "✅ Google Play Store (com.android.vending) đã cài."
+          else
+            echo "⚠️ Không tìm thấy Google Play Store."
+            if [ "${{ github.event.inputs.gapps }}" = "y" ]; then
+              echo "::warning::GApps được chọn nhưng Play Store không có. Image có thể chưa init xong."
+              echo "Danh sách package hiện có:"
+              adb -s localhost:5555 shell pm list packages | head -30
+            fi
+          fi
+
+      # ─────────────────────────────────────────────
+      # 12. Cài Brave (fallback nếu không có browser)
+      # ─────────────────────────────────────────────
+      - name: Cài trình duyệt Brave nếu chưa có browser
+        run: |
+          if adb -s localhost:5555 shell pm list packages 2>/dev/null \
+              | grep -qE "chrome|firefox|org\.mozilla|brave|com\.brave"; then
+            echo "✅ Đã có trình duyệt, bỏ qua."
+          else
+            ARCH="${{ github.event.inputs.arch }}"
+            if [ "$ARCH" = "arm64" ]; then
+              # Native arm64 APK
+              BRAVE_URL="https://github.com/brave/brave-browser/releases/download/v1.93.132/Bravearm64Universal.apk"
+              BRAVE_APK="brave-arm64.apk"
+            else
+              # Universal APK hoạt động trên cả x86 qua NDK translation
+              BRAVE_URL="https://github.com/brave/brave-browser/releases/download/v1.93.132/Bravearm64Universal.apk"
+              BRAVE_APK="brave-universal.apk"
+            fi
+
+            echo "📥 Tải Brave APK ($ARCH)..."
+            curl -L "$BRAVE_URL" -o "$BRAVE_APK"
+            echo "sha256: $(sha256sum $BRAVE_APK | awk '{print $1}')"
+            file "$BRAVE_APK"
+
+            adb -s localhost:5555 install -r "$BRAVE_APK" \
+              && echo "✅ Brave installed" \
+              || echo "⚠️ Cài Brave thất bại, xem log ở trên."
+          fi
+
+      # ─────────────────────────────────────────────
+      # 13. Kiểm tra scrcpy-web
+      # ─────────────────────────────────────────────
       - name: Kiểm tra scrcpy-web đã sẵn sàng
         run: |
-          for i in $(seq 1 15); do
-            if curl -s -o /dev/null -w "%{http_code}" http://localhost:8000 | grep -q "200"; then
-              echo "✅ scrcpy-web đã sẵn sàng tại http://localhost:8000"
+          for i in $(seq 1 20); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000 || echo "000")
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "✅ scrcpy-web sẵn sàng tại http://localhost:8000"
               break
             fi
-            echo "Đợi scrcpy-web... ($i/15)"
+            echo "Đợi scrcpy-web... ($i/20) [HTTP $HTTP_CODE]"
             sleep 5
           done
 
-      - name: Cài trình duyệt Brave (bản đúng kiến trúc đã chọn: ${{ github.event.inputs.arch }})
-        run: |
-          if adb -s localhost:5555 shell pm list packages | grep -qE "chrome|firefox|org.mozilla|brave|com.brave|com.android.vending"; then
-            echo "✅ Đã có trình duyệt hoặc Play Store cài sẵn, bỏ qua cài Brave."
-          else
-            BRAVE_ARCH_FILE="Bravearm64Universal.apk"
-            if [ "${{ github.event.inputs.arch }}" = "amd64" ]; then
-              BRAVE_ARCH_FILE="BraveMonox64.apk"
-            fi
-            echo "📥 Tải Brave APK bản $BRAVE_ARCH_FILE (đúng arch host, không cần lớp dịch)..."
-            BRAVE_URL="https://github.com/brave/brave-browser/releases/download/v1.93.132/${BRAVE_ARCH_FILE}"
-            curl -L "$BRAVE_URL" -o brave.apk
-
-            echo "sha256 file tải về: $(sha256sum brave.apk | awk '{print $1}')"
-            file brave.apk
-
-            adb -s localhost:5555 install -r brave.apk && echo "✅ Brave installed" || echo "⚠️ Cài thất bại, xem log ở trên."
-          fi
-
-      - name: Cài dependencies và chạy upload server (không cần checkout repo)
+      # ─────────────────────────────────────────────
+      # 14. Upload server
+      # ─────────────────────────────────────────────
+      - name: Cài dependencies và chạy upload server
         run: |
           mkdir -p uploads
           sudo chmod 777 uploads
           mkdir -p upload-server && cd upload-server
           npm init -y >/dev/null 2>&1
           npm install express multer >/dev/null 2>&1
+
           cat > server.js <<'JSEOF'
-          const express = require('express');
-          const multer = require('multer');
-          const { execFile } = require('child_process');
-          const path = require('path');
+const express = require('express');
+const multer  = require('multer');
+const { execFile } = require('child_process');
+const path = require('path');
 
-          const app = express();
-          const upload = multer({ dest: path.join(__dirname, '../uploads') });
+const app    = express();
+const upload = multer({ dest: path.join(__dirname, '../uploads') });
 
-          app.get('/', (req, res) => {
-            res.send(`
-              <html><body style="font-family:sans-serif;padding:20px">
-              <h2>📤 Upload file vào máy ảo Android</h2>
-              <form method="POST" action="/upload" enctype="multipart/form-data">
-                <input type="file" name="files" multiple />
-                <button type="submit">Upload</button>
-              </form>
-              </body></html>
-            `);
-          });
+app.get('/', (req, res) => {
+  res.send(`
+    <html><body style="font-family:sans-serif;padding:20px">
+    <h2>📤 Upload file vào máy ảo Android</h2>
+    <form method="POST" action="/upload" enctype="multipart/form-data">
+      <input type="file" name="files" multiple />
+      <button type="submit">Upload</button>
+    </form>
+    </body></html>
+  `);
+});
 
-          app.post('/upload', upload.array('files'), (req, res) => {
-            const files = req.files || [];
-            if (files.length === 0) return res.json({ success: false, message: 'Không có file nào' });
+app.post('/upload', upload.array('files'), (req, res) => {
+  const files = req.files || [];
+  if (files.length === 0)
+    return res.json({ success: false, message: 'Không có file nào' });
 
-            let done = 0;
-            const results = [];
-            files.forEach((f) => {
-              const dest = '/sdcard/Download/' + f.originalname;
-              execFile('adb', ['-s', 'localhost:5555', 'push', f.path, dest], (err) => {
-                results.push({ file: f.originalname, success: !err, error: err ? err.message : null });
-                done++;
-                if (done === files.length) {
-                  res.json({ success: results.every(r => r.success), results });
-                }
-              });
-            });
-          });
+  let done = 0;
+  const results = [];
+  files.forEach((f) => {
+    const dest = '/sdcard/Download/' + f.originalname;
+    execFile('adb', ['-s', 'localhost:5555', 'push', f.path, dest], (err) => {
+      results.push({ file: f.originalname, success: !err, error: err?.message ?? null });
+      done++;
+      if (done === files.length)
+        res.json({ success: results.every(r => r.success), results });
+    });
+  });
+});
 
-          app.get('/list', (req, res) => res.json({ status: 'ok' }));
+app.get('/list', (req, res) => res.json({ status: 'ok' }));
 
-          app.listen(3000, () => console.log('Upload server chạy tại port 3000'));
-          JSEOF
+app.listen(3000, () => console.log('Upload server chạy tại port 3000'));
+JSEOF
+
           cd ..
           nohup node upload-server/server.js > upload-server.log 2>&1 &
           disown
@@ -433,19 +505,22 @@ jobs:
           if curl -s http://localhost:3000/list > /dev/null; then
             echo "✅ Upload server đang chạy"
           else
-            echo "❌ Upload server không khởi động, xem log:"
+            echo "❌ Upload server không khởi động:"
             cat upload-server.log
           fi
 
-      - name: Cài Cloudflare Tunnel (đúng arch, có watchdog tự reconnect)
+      # ─────────────────────────────────────────────
+      # 15. Cloudflare Tunnel
+      #     Dùng đúng binary theo arch đã tính ở step 0
+      # ─────────────────────────────────────────────
+      - name: Cài Cloudflare Tunnel (có watchdog tự reconnect)
         run: |
-          CLOUDFLARED_ARCH="arm64"
-          if [ "${{ github.event.inputs.arch }}" = "amd64" ]; then
-            CLOUDFLARED_ARCH="amd64"
-          fi
-          curl -L "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CLOUDFLARED_ARCH}" -o cloudflared
+          echo "📥 Tải cloudflared binary: ${CLOUDFLARED_BIN}"
+          curl -L "https://github.com/cloudflare/cloudflared/releases/latest/download/${CLOUDFLARED_BIN}" \
+            -o cloudflared
           chmod +x cloudflared
           sudo mv cloudflared /usr/local/bin/
+
           pkill cloudflared || true
           > cloudflared.log
           > cloudflared-upload.log
@@ -461,67 +536,77 @@ jobs:
             sleep 3
             URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cloudflared.log | head -n1 || true)
             if [ -n "$URL" ]; then
-              echo "Tìm thấy tunnel chính: $URL"
+              echo "✅ Tunnel chính: $URL"
               echo "TUNNEL_URL=$URL" >> $GITHUB_ENV
               break
             fi
           done
+
           UPLOAD_URL=""
           for i in $(seq 1 20); do
             sleep 2
-            UPLOAD_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cloudflared-upload.log | head -n1 || true)
+            UPLOAD_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' \
+              cloudflared-upload.log | head -n1 || true)
             if [ -n "$UPLOAD_URL" ]; then
-              echo "Tìm thấy tunnel upload: $UPLOAD_URL"
+              echo "✅ Tunnel upload: $UPLOAD_URL"
               echo "UPLOAD_URL=$UPLOAD_URL" >> $GITHUB_ENV
               break
             fi
           done
+
           cat cloudflared.log
 
-          # Watchdog nền: tự khởi động lại nếu 1 trong 2 tunnel chết
+          # Watchdog nền: tự restart nếu tunnel chết
           nohup bash -c '
             while true; do
               sleep 15
               pgrep -f "cloudflared tunnel --url http://localhost:8000" > /dev/null || {
-                echo "[watchdog] tunnel chinh chet, khoi dong lai..." >> cloudflared.log
+                echo "[watchdog] tunnel chính chết, restart..." >> cloudflared.log
                 nohup cloudflared tunnel --url http://localhost:8000 >> cloudflared.log 2>&1 &
               }
               pgrep -f "cloudflared tunnel --url http://localhost:3000" > /dev/null || {
-                echo "[watchdog] tunnel upload chet, khoi dong lai..." >> cloudflared-upload.log
+                echo "[watchdog] tunnel upload chết, restart..." >> cloudflared-upload.log
                 nohup cloudflared tunnel --url http://localhost:3000 >> cloudflared-upload.log 2>&1 &
               }
             done
           ' > cloudflared-watchdog.log 2>&1 &
           disown
 
+      # ─────────────────────────────────────────────
+      # 16. Hướng dẫn sử dụng
+      # ─────────────────────────────────────────────
       - name: In hướng dẫn sử dụng
         run: |
           echo "=========================================="
-          echo "📱 Truy cập vào Android của bạn tại:"
+          echo "📱 Truy cập Android của bạn tại:"
           echo "   ${TUNNEL_URL}"
           echo "📤 Upload file tại:"
           echo "   ${UPLOAD_URL}"
           echo ""
-          echo "🖼️  Image Redroid: ${{ env.REDROID_IMAGE }}"
-          echo "🏗️  Kiến trúc: ${{ github.event.inputs.arch }} | Android: ${{ github.event.inputs.android_version }}"
-          echo "🔧 GApps: ${{ github.event.inputs.gapps_type }} | Root: ${{ github.event.inputs.root }}"
-          echo "💻 RAM: ${{ github.event.inputs.ram_gb }}GB | CPU: ${{ env.CPU_LIMIT }} core"
-          echo "💾 Lưu dữ liệu qua các lần chạy: ${{ github.event.inputs.save_data }}"
+          echo "🤖 Android ${ANDROID_VER} | GApps: ${{ github.event.inputs.gapps }} | Root: ${{ github.event.inputs.root }}"
+          echo "🏗️  Arch: ${{ github.event.inputs.arch }} | RAM: ${{ github.event.inputs.ram_gb }}GB | CPU: ${CPU_LIMIT} core"
+          echo "💾 Lưu dữ liệu: ${{ github.event.inputs.save_data }}"
+          echo "🐳 Image: ${IMAGE_TAG}"
           echo "=========================================="
 
-      - name: Giữ job chạy trong 350 phút
+      # ─────────────────────────────────────────────
+      # 17. Keepalive 340 phút
+      # ─────────────────────────────────────────────
+      - name: Giữ job chạy trong 340 phút
         run: |
           END=$((SECONDS + 340*60))
           LAST_URL=""
           LAST_UPLOAD_URL=""
           while [ $SECONDS -lt $END ]; do
             sleep 60
-            CUR_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cloudflared.log | tail -n1 || true)
+            CUR_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' \
+              cloudflared.log | tail -n1 || true)
             if [ -n "$CUR_URL" ] && [ "$CUR_URL" != "$LAST_URL" ]; then
               echo "🔄 URL scrcpy hiện tại: $CUR_URL"
               LAST_URL="$CUR_URL"
             fi
-            CUR_UPLOAD=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cloudflared-upload.log | tail -n1 || true)
+            CUR_UPLOAD=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' \
+              cloudflared-upload.log | tail -n1 || true)
             if [ -n "$CUR_UPLOAD" ] && [ "$CUR_UPLOAD" != "$LAST_UPLOAD_URL" ]; then
               echo "🔄 URL upload hiện tại: $CUR_UPLOAD"
               LAST_UPLOAD_URL="$CUR_UPLOAD"
