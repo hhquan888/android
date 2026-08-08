@@ -1,615 +1,275 @@
-name: CloudPhone với Redroid và scrcpy-web
+name: CloudPhone voi Redroid va scrcpy-web
 
 on:
   workflow_dispatch:
     inputs:
       android_version:
-        description: 'Phiên bản Android'
+        description: "Phien ban Android"
         required: true
-        default: '12'
+        default: "12"
         type: choice
         options:
-          - '9'
-          - '10'
-          - '11'
-          - '12'
-
+          - "9"
+          - "10"
+          - "11"
+          - "12"
       gapps:
-        description: 'Cài Google Play (GApps)?'
+        description: "Cai Google Play (GApps)?"
         required: true
-        default: 'y'
+        default: "y"
         type: choice
         options:
-          - 'y'
-          - 'n'
-
+          - "y"
+          - "n"
       root:
-        description: 'Bật root (Magisk/su)?'
+        description: "Bat root (Magisk/su)?"
         required: true
-        default: '0'
+        default: "0"
         type: choice
         options:
-          - '0'   # No root
-          - '1'   # Root
-
+          - "0"
+          - "1"
       arch:
-        description: 'Kiến trúc runner (arm64 = nhanh hơn nếu bạn có, amd64 = phổ thông nhất)'
+        description: "Kien truc runner (arm64 / amd64)"
         required: true
-        default: 'amd64'
+        default: "amd64"
         type: choice
         options:
-          - 'amd64'
-          - 'arm64'
-
+          - "amd64"
+          - "arm64"
       ram_gb:
-        description: 'Giới hạn RAM cho máy ảo (GB)'
+        description: "Gioi han RAM cho may ao (GB)"
         required: true
-        default: '4'
+        default: "4"
         type: choice
         options:
-          - '2'
-          - '4'
-          - '8'
-          - '12'
-
+          - "2"
+          - "4"
+          - "8"
+          - "12"
       save_data:
-        description: 'Lưu dữ liệu máy ảo qua các lần chạy? y = lưu, n = luôn làm mới'
+        description: "Luu du lieu may ao? y=luu n=lam moi"
         required: true
-        default: 'n'
+        default: "n"
         type: choice
         options:
-          - 'y'
-          - 'n'
+          - "y"
+          - "n"
 
 jobs:
   cloudphone:
-    # Tự động chọn runner theo input arch
     runs-on: ${{ github.event.inputs.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 350
 
     steps:
-      # ─────────────────────────────────────────────
-      # 0. Tính toán image Redroid và các biến arch
-      # ─────────────────────────────────────────────
-      - name: Tính toán image Redroid + biến kiến trúc
+      - name: Tinh toan image Redroid + bien kien truc
         run: |
           ANDROID_VER="${{ github.event.inputs.android_version }}"
           GAPPS="${{ github.event.inputs.gapps }}"
           ROOT="${{ github.event.inputs.root }}"
           ARCH="${{ github.event.inputs.arch }}"
-
-          # ── Chọn image tag ──
-          # furtif/redroid hỗ trợ 4 variant per version:
-          #   <ver>          → AOSP, no root
-          #   <ver>-gapps    → GApps, no root  (chỉ có từ Android 11+)
-          #   <ver>-rooted   → AOSP, root
-          #   <ver>-rooted-gapps → GApps + root
-          #
-          # Android 9/10 không có tag -gapps riêng trên furtif,
-          # dùng rooted-gapps rồi bỏ qua bước adb root nếu root=0.
-
+          RAM="${{ github.event.inputs.ram_gb }}"
           if [ "$GAPPS" = "y" ] && [ "$ROOT" = "1" ]; then
             IMAGE_TAG="furtif/redroid:${ANDROID_VER}.0.0-rooted-gapps"
           elif [ "$GAPPS" = "y" ] && [ "$ROOT" = "0" ]; then
-            # Android 11+ có tag -gapps thuần; 9/10 dùng rooted-gapps + không chạy adb root
-            if [ "$ANDROID_VER" -ge 11 ]; then
-              IMAGE_TAG="furtif/redroid:${ANDROID_VER}.0.0-gapps"
-            else
-              IMAGE_TAG="furtif/redroid:${ANDROID_VER}.0.0-rooted-gapps"
-            fi
+            if [ "$ANDROID_VER" -ge 11 ]; then IMAGE_TAG="furtif/redroid:${ANDROID_VER}.0.0-gapps"
+            else IMAGE_TAG="furtif/redroid:${ANDROID_VER}.0.0-rooted-gapps"; fi
           elif [ "$GAPPS" = "n" ] && [ "$ROOT" = "1" ]; then
             IMAGE_TAG="furtif/redroid:${ANDROID_VER}.0.0-rooted"
           else
             IMAGE_TAG="furtif/redroid:${ANDROID_VER}.0.0"
           fi
-
-          # ── ABI list theo arch ──
           if [ "$ARCH" = "arm64" ]; then
-            # Host ARM64 → app ARM chạy native, không cần lớp dịch x86
             ABILIST="arm64-v8a,armeabi-v7a,armeabi"
             ABILIST64="arm64-v8a"
             ABILIST32="armeabi-v7a,armeabi"
-            # Không cần libndk/houdini trên arm64
             NDK_TRANSLATION=""
+            CLOUDFLARED_BIN="cloudflared-linux-arm64"
           else
-            # Host AMD64 (x86_64) → cần lớp dịch ARM→x86 qua libndk_translation
             ABILIST="x86_64,x86,arm64-v8a,armeabi-v7a,armeabi"
             ABILIST64="x86_64,arm64-v8a"
             ABILIST32="x86,armeabi-v7a,armeabi"
-            # Bật libndk_translation để app ARM chạy được trên host x86
             NDK_TRANSLATION="ro.dalvik.vm.native.bridge=libndk_translation.so"
-          fi
-
-          # ── cloudflared binary theo arch ──
-          if [ "$ARCH" = "arm64" ]; then
-            CLOUDFLARED_BIN="cloudflared-linux-arm64"
-          else
             CLOUDFLARED_BIN="cloudflared-linux-amd64"
           fi
-
-          # ── Xuất tất cả ra GITHUB_ENV ──
+          CPU_COUNT=$(nproc)
+          if [ "$CPU_COUNT" -ge 4 ]; then CPU_LIMIT=4; else CPU_LIMIT=$CPU_COUNT; fi
           echo "IMAGE_TAG=$IMAGE_TAG"             >> $GITHUB_ENV
           echo "ABILIST=$ABILIST"                 >> $GITHUB_ENV
           echo "ABILIST64=$ABILIST64"             >> $GITHUB_ENV
           echo "ABILIST32=$ABILIST32"             >> $GITHUB_ENV
           echo "NDK_TRANSLATION=$NDK_TRANSLATION" >> $GITHUB_ENV
           echo "CLOUDFLARED_BIN=$CLOUDFLARED_BIN" >> $GITHUB_ENV
+          echo "CPU_LIMIT=$CPU_LIMIT"             >> $GITHUB_ENV
+          echo "RAM_GB=$RAM"                      >> $GITHUB_ENV
+          echo "Image: $IMAGE_TAG | ABI: $ABILIST | NDK: ${NDK_TRANSLATION:-none} | CF: $CLOUDFLARED_BIN"
 
-          echo "✅ Image:        $IMAGE_TAG"
-          echo "✅ ABI list:     $ABILIST"
-          echo "✅ cloudflared:  $CLOUDFLARED_BIN"
-          echo "✅ NDK bridge:   ${NDK_TRANSLATION:-'(không cần — host arm64)'}"
-
-      # ─────────────────────────────────────────────
-      # 1. Cache dữ liệu máy ảo
-      # ─────────────────────────────────────────────
-      - name: Khôi phục dữ liệu máy ảo lần chạy trước (nếu bật lưu)
+      - name: Khoi phuc du lieu may ao (neu bat luu)
         if: ${{ github.event.inputs.save_data == 'y' }}
         uses: actions/cache@v4
         with:
           path: data
-          key: cloudphone-alpha-data-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.arch }}
+          key: cloudphone-data-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.arch }}
           restore-keys: |
-            cloudphone-alpha-data-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.arch }}
+            cloudphone-data-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.arch }}
 
-      # ─────────────────────────────────────────────
-      # 2. Cài công cụ
-      # ─────────────────────────────────────────────
-      - name: Cài đặt công cụ cần thiết
+      - name: Cai dat cong cu can thiet
         run: |
           sudo apt-get update
           sudo apt-get install -y android-tools-adb curl
-          sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" \
-            -o /usr/local/bin/docker-compose
+          sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
           sudo chmod +x /usr/local/bin/docker-compose
           docker-compose --version
 
-      # ─────────────────────────────────────────────
-      # 3. Kernel modules (binder / ashmem)
-      # ─────────────────────────────────────────────
-      - name: Tải module kernel binder (cần cho Redroid)
+      - name: Tai module kernel binder
         run: |
-          # Thử cài linux-modules-extra, bỏ qua nếu không có
           sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
-          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder" || {
-            echo "⚠️ binder_linux không load được, thử binderfs..."
-            sudo modprobe binderfs || echo "⚠️ binderfs cũng không load được — Redroid có thể không khởi động"
-          }
+          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder" || sudo modprobe binderfs || echo "binder khong load duoc"
           sudo modprobe ashmem_linux || true
-          echo "Modules đang load:"
-          lsmod | grep -E "binder|ashmem" || echo "(không có module nào khớp)"
+          lsmod | grep -E "binder|ashmem" || echo "(khong co module nao khop)"
 
-      # ─────────────────────────────────────────────
-      # 4. CPU limit
-      # ─────────────────────────────────────────────
-      - name: Phát hiện số core CPU của runner
-        run: |
-          CPU_COUNT=$(nproc)
-          if [ "$CPU_COUNT" -ge 4 ]; then
-            CPU_LIMIT=4
-          else
-            CPU_LIMIT=$CPU_COUNT
-          fi
-          echo "Runner có $CPU_COUNT core, giới hạn cấp cho container: $CPU_LIMIT"
-          echo "CPU_LIMIT=$CPU_LIMIT" >> $GITHUB_ENV
-
-      # ─────────────────────────────────────────────
-      # 5. Build ws-scrcpy
-      # ─────────────────────────────────────────────
-      - name: Tải bản ws-scrcpy custom đã build sẵn (hhquan888/ws-scrcpy)
+      - name: Tai ws-scrcpy va tao Dockerfile
         run: |
           mkdir -p ws-scrcpy-build
-          echo "📥 Tải ws-scrcpy-dist.zip..."
-          curl -L "https://github.com/hhquan888/ws-scrcpy/releases/download/1.0/ws-scrcpy-dist.zip" \
-            -o ws-scrcpy-dist.zip
-
-          EXPECTED_SHA256="5fedd7aa159a7696689cf943abc4c080518bab2b44d94cf5ebe3bf585a540d24"
-          ACTUAL_SHA256=$(sha256sum ws-scrcpy-dist.zip | awk '{print $1}')
-          echo "Expected: $EXPECTED_SHA256"
-          echo "Actual:   $ACTUAL_SHA256"
-          if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
-            echo "❌ sha256 KHÔNG khớp — dừng lại để an toàn."
-            exit 1
-          fi
-          echo "✅ sha256 khớp."
-
+          curl -L "https://github.com/hhquan888/ws-scrcpy/releases/download/1.0/ws-scrcpy-dist.zip" -o ws-scrcpy-dist.zip
+          EXPECTED="5fedd7aa159a7696689cf943abc4c080518bab2b44d94cf5ebe3bf585a540d24"
+          ACTUAL=$(sha256sum ws-scrcpy-dist.zip | awk '{print $1}')
+          if [ "$ACTUAL" != "$EXPECTED" ]; then echo "sha256 KHONG khop"; exit 1; fi
           unzip -o ws-scrcpy-dist.zip -d ws-scrcpy-build
-          echo "Cấu trúc sau khi giải nén:"
-          find ws-scrcpy-build -maxdepth 2
+          echo "RlJPTSBub2RlOjE4LXNsaW0KUlVOIGFwdC1nZXQgdXBkYXRlICYmIFwKICAgIGFwdC1nZXQgaW5zdGFsbCAteSBhbmRyb2lkLXRvb2xzLWFkYiBjdXJsIHB5dGhvbjMgbWFrZSBnKysgJiYgXAogICAgcm0gLXJmIC92YXIvbGliL2FwdC9saXN0cy8qCldPUktESVIgL2FwcApDT1BZIC4gLgpSVU4gbnBtIGluc3RhbGwgLS1vbWl0PWRldiAtLW5vLWF1ZGl0IC0tbm8tZnVuZApFWFBPU0UgODAwMApDTUQgWyJucG0iLCAic3RhcnQiXQo=" | base64 -d > ws-scrcpy-build/Dockerfile
+          cat ws-scrcpy-build/Dockerfile
 
-          # node-pty là native module → cần python3/make/g++ để biên dịch C++
-          cat > ws-scrcpy-build/Dockerfile <<'DOCKERFILEEOF'
-FROM node:18-slim
-RUN apt-get update && \
-    apt-get install -y android-tools-adb curl python3 make g++ && \
-    rm -rf /var/lib/apt/lists/*
-WORKDIR /app
-COPY . .
-RUN npm install --omit=dev --no-audit --no-fund
-EXPOSE 8000
-CMD ["npm", "start"]
-DOCKERFILEEOF
-
-      # ─────────────────────────────────────────────
-      # 6. docker-compose.yml
-      #    Dùng env vars đã tính ở step 0
-      # ─────────────────────────────────────────────
-      - name: Tạo docker-compose.yml cho Redroid và scrcpy-web
+      - name: Tao docker-compose.yml
         run: |
           mkdir -p data
-
-          # Build dòng command Redroid — thêm NDK bridge nếu chạy trên amd64
-          NDK_LINE=""
-          if [ -n "$NDK_TRANSLATION" ]; then
-            NDK_LINE="                - ${NDK_TRANSLATION}"
-          fi
-
-          cat > docker-compose.yml <<COMPOSEEOF
-services:
-  redroid:
-    container_name: redroid
-    image: ${IMAGE_TAG}
-    privileged: true
-    mem_limit: ${{ github.event.inputs.ram_gb }}g
-    memswap_limit: ${{ github.event.inputs.ram_gb }}g
-    cpus: "${CPU_LIMIT}"
-    ports:
-      - "5555:5555"
-    volumes:
-      - ./data:/data
-    environment:
-      - REDROID_WIDTH=720
-      - REDROID_HEIGHT=1280
-      - REDROID_FPS=30
-    command:
-      - ro.product.cpu.abilist=${ABILIST}
-      - ro.product.cpu.abilist64=${ABILIST64}
-      - ro.product.cpu.abilist32=${ABILIST32}
-$([ -n "$NDK_TRANSLATION" ] && echo "      - ${NDK_TRANSLATION}" || true)
-    restart: unless-stopped
-
-  custom-ws-scrcpy:
-    container_name: custom-ws-scrcpy
-    build:
-      context: ./ws-scrcpy-build
-      dockerfile: Dockerfile
-    image: custom-ws-scrcpy:latest
-    privileged: true
-    ports:
-      - "8000:8000"
-    depends_on:
-      - redroid
-    restart: unless-stopped
-    command: >
-      sh -c "
-        adb start-server &&
-        echo 'Cho Redroid khởi động + kết nối ADB lần đầu...' &&
-        for i in \$(seq 1 30); do
-          adb connect redroid:5555 | grep -q connected && break
-          echo 'retry adb connect...'
-          sleep 5
-        done &&
-        ( while true; do
-            sleep 10
-            adb devices | grep -q 'redroid:5555.*device' || {
-              echo 'ADB mất kết nối, reconnect...'
-              adb connect redroid:5555
-            }
-          done ) &
-        echo 'Khởi động custom-ws-scrcpy...' &&
-        npm start
-      "
-COMPOSEEOF
-
+          echo "aW1wb3J0IG9zLGJhc2U2NAp0PWJhc2U2NC5iNjRkZWNvZGUoJ2MyVnlkbWxqWlhNNkNpQWdjbVZrY205cFpEb0tJQ0FnSUdOdmJuUmhhVzVsY2w5dVlXMWxPaUJ5WldSeWIybGtDaUFnSUNCcGJXRm5aVG9nVWtWRVVrOUpSRjlKVFVGSFJRb2dJQ0FnY0hKcGRtbHNaV2RsWkRvZ2RISjFaUW9nSUNBZ2JXVnRYMnhwYldsME9pQlNRVTFmUjBKbkNpQWdJQ0J0WlcxemQyRndYMnhwYldsME9pQlNRVTFmUjBKbkNpQWdJQ0JqY0hWek9pQWlRMUJWWDB4SlRVbFVYMVpCVENJS0lDQWdJSEJ2Y25Sek9nb2dJQ0FnSUNBdElDSTFOVFUxT2pVMU5UVWlDaUFnSUNCMmIyeDFiV1Z6T2dvZ0lDQWdJQ0F0SUM0dlpHRjBZVG92WkdGMFlRb2dJQ0FnWlc1MmFYSnZibTFsYm5RNkNpQWdJQ0FnSUMwZ1VrVkVVazlKUkY5WFNVUlVTRDAzTWpBS0lDQWdJQ0FnTFNCU1JVUlNUMGxFWDBoRlNVZElWRDB4TWpnd0NpQWdJQ0FnSUMwZ1VrVkVVazlKUkY5R1VGTTlNekFLSUNBZ0lHTnZiVzFoYm1RNkNpQWdJQ0FnSUMwZ2NtOHVjSEp2WkhWamRDNWpjSFV1WVdKcGJHbHpkRDFCUWtsTVNWTlVYMVpCVEFvZ0lDQWdJQ0F0SUhKdkxuQnliMlIxWTNRdVkzQjFMbUZpYVd4cGMzUTJORDFCUWtsTVNWTlVOalJmVmtGTUNpQWdJQ0FnSUMwZ2NtOHVjSEp2WkhWamRDNWpjSFV1WVdKcGJHbHpkRE15UFVGQ1NVeEpVMVF6TWw5V1FVd0tUa1JMWDB4SlRrVWdJQ0FnY21WemRHRnlkRG9nZFc1c1pYTnpMWE4wYjNCd1pXUUtDaUFnWTNWemRHOXRMWGR6TFhOamNtTndlVG9LSUNBZ0lHTnZiblJoYVc1bGNsOXVZVzFsT2lCamRYTjBiMjB0ZDNNdGMyTnlZM0I1Q2lBZ0lDQmlkV2xzWkRvS0lDQWdJQ0FnWTI5dWRHVjRkRG9nTGk5M2N5MXpZM0pqY0hrdFluVnBiR1FLSUNBZ0lDQWdaRzlqYTJWeVptbHNaVG9nUkc5amEyVnlabWxzWlFvZ0lDQWdhVzFoWjJVNklHTjFjM1J2YlMxM2N5MXpZM0pqY0hrNmJHRjBaWE4wQ2lBZ0lDQndjbWwyYVd4bFoyVmtPaUIwY25WbENpQWdJQ0J3YjNKMGN6b0tJQ0FnSUNBZ0xTQWlPREF3TURvNE1EQXdJZ29nSUNBZ1pHVndaVzVrYzE5dmJqb0tJQ0FnSUNBZ0xTQnlaV1J5YjJsa0NpQWdJQ0J5WlhOMFlYSjBPaUIxYm14bGMzTXRjM1J2Y0hCbFpBb2dJQ0FnWlc1MGNubHdiMmx1ZERvS0lDQWdJQ0FnTFNCemFBb2dJQ0FnSUNBdElDMWpDaUFnSUNBZ0lDMGdJbUZrWWlCemRHRnlkQzF6WlhKMlpYSWdKaVlnWm05eUlHa2dhVzRnSkNoelpYRWdNU0F6TUNrN0lHUnZJR0ZrWWlCamIyNXVaV04wSUhKbFpISnZhV1E2TlRVMU5TQjhJR2R5WlhBZ0xYRWdZMjl1Ym1WamRHVmtJQ1ltSUdKeVpXRnJPeUJsWTJodklISmxkSEo1T3lCemJHVmxjQ0ExT3lCa2IyNWxJQ1ltSUNnZ2QyaHBiR1VnZEhKMVpUc2daRzhnYzJ4bFpYQWdNVEE3SUdGa1lpQmtaWFpwWTJWeklId2daM0psY0NBdGNTQW5jbVZrY205cFpEbzFOVFUxTGlwa1pYWnBZMlVuSUh4OElHRmtZaUJqYjI1dVpXTjBJSEpsWkhKdmFXUTZOVFUxTlRzZ1pHOXVaU0FwSUNZZ2JuQnRJSE4wWVhKMElnbz0nKS5kZWNvZGUoKQp0PXQucmVwbGFjZSgnUkVEUk9JRF9JTUFHRScsb3MuZW52aXJvblsnSU1BR0VfVEFHJ10pCnQ9dC5yZXBsYWNlKCdSQU1fR0InLG9zLmVudmlyb25bJ1JBTV9HQiddKQp0PXQucmVwbGFjZSgnQ1BVX0xJTUlUX1ZBTCcsb3MuZW52aXJvblsnQ1BVX0xJTUlUJ10pCnQ9dC5yZXBsYWNlKCdBQklMSVNUX1ZBTCcsb3MuZW52aXJvblsnQUJJTElTVCddKQp0PXQucmVwbGFjZSgnQUJJTElTVDY0X1ZBTCcsb3MuZW52aXJvblsnQUJJTElTVDY0J10pCnQ9dC5yZXBsYWNlKCdBQklMSVNUMzJfVkFMJyxvcy5lbnZpcm9uWydBQklMSVNUMzInXSkKbmRrPW9zLmVudmlyb24uZ2V0KCdOREtfVFJBTlNMQVRJT04nLCcnKQp0PXQucmVwbGFjZSgnTkRLX0xJTkUnLCgnICAgICAgLSAnK25kaysnXG4nKSBpZiBuZGsgZWxzZSAnJykKb3BlbignZG9ja2VyLWNvbXBvc2UueW1sJywndycpLndyaXRlKHQpCnByaW50KCdkb2NrZXItY29tcG9zZS55bWwgd3JpdHRlbicpCg==" | base64 -d | python3
           echo "=== docker-compose.yml ==="
           cat docker-compose.yml
 
-      # ─────────────────────────────────────────────
-      # 7. Khởi chạy containers
-      # ─────────────────────────────────────────────
-      - name: Khởi chạy Redroid và scrcpy-web
+      - name: Khoi chay Redroid va scrcpy-web
         run: |
           docker-compose up -d
-          echo "Đợi các container khởi động (30s)..."
+          echo "Doi containers (30s)..."
           sleep 30
           docker ps -a
 
-      - name: "[CHẨN ĐOÁN] Log tất cả container"
+      - name: "[CHAN DOAN] Log tat ca container"
         run: |
-          for name in $(docker ps -a --format '{{.Names}}'); do
-            echo "===================== docker logs $name ====================="
+          for name in $(docker ps -a --format "{{.Names}}"); do
+            echo "===== $name ====="
             docker logs "$name" 2>&1 | tail -n 100
-            docker inspect "$name" \
-              --format "$name state: {{.State.Status}} (restarts: {{.RestartCount}})"
-            echo ""
+            docker inspect "$name" --format "status: {{.State.Status}} restarts: {{.RestartCount}}"
           done
 
-      # ─────────────────────────────────────────────
-      # 8. Chờ Android boot
-      # ─────────────────────────────────────────────
-      - name: Kiểm tra ADB kết nối và boot hoàn tất
+      - name: Kiem tra ADB va boot hoan tat
         run: |
           adb connect localhost:5555 || true
           adb devices -l
-
-          echo "Chờ Android boot hoàn tất (kiểm tra sys.boot_completed)..."
           for i in $(seq 1 36); do
-            BOOTED=$(adb -s localhost:5555 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
-            if [ "$BOOTED" = "1" ]; then
-              echo "✅ Android đã boot xong!"
-              break
-            fi
-            echo "Đợi boot... ($i/36)"
-            sleep 10
+            BOOTED=$(adb -s localhost:5555 shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")
+            if [ "$BOOTED" = "1" ]; then echo "Android da boot xong!"; break; fi
+            echo "Doi boot... ($i/36)"; sleep 10
           done
-
           STATE=$(adb -s localhost:5555 get-state 2>/dev/null || echo "unknown")
           echo "ADB state: $STATE"
-          if [ "$STATE" != "device" ]; then
-            echo "::warning::ADB chưa ở trạng thái device, tiếp tục..."
-          fi
+          [ "$STATE" != "device" ] && echo "::warning::ADB chua o trang thai device" || true
 
-      # ─────────────────────────────────────────────
-      # 9. Root (chỉ khi root=1)
-      # ─────────────────────────────────────────────
-      - name: Bật root (nếu chọn root=1)
+      - name: Bat root (neu chon root=1)
         if: ${{ github.event.inputs.root == '1' }}
         run: |
           adb -s localhost:5555 root
           sleep 3
           adb connect localhost:5555 || true
-          adb -s localhost:5555 remount \
-            || echo "⚠️ remount thất bại (bình thường nếu image không cho remount system)"
-          echo "whoami sau khi root:"
+          adb -s localhost:5555 remount || echo "remount that bai"
           adb -s localhost:5555 shell whoami
 
-      # ─────────────────────────────────────────────
-      # 10. Chẩn đoán ABI + RAM/CPU
-      # ─────────────────────────────────────────────
-      - name: Kiểm tra abilist và thông tin hệ thống
+      - name: Kiem tra abilist va he thong
         run: |
-          echo "=== ABI list ==="
           adb -s localhost:5555 shell getprop ro.product.cpu.abilist
-          echo "=== Android version ==="
           adb -s localhost:5555 shell getprop ro.build.version.release
-          echo "=== NDK bridge ==="
-          adb -s localhost:5555 shell getprop ro.dalvik.vm.native.bridge || echo "(không có)"
-          echo "=== RAM theo Android ==="
+          adb -s localhost:5555 shell getprop ro.dalvik.vm.native.bridge || echo "(khong co)"
           adb -s localhost:5555 shell cat /proc/meminfo | head -n 3
+          docker inspect redroid --format "Memory: {{.HostConfig.Memory}} | CPUs: {{.HostConfig.NanoCpus}}"
 
-      - name: Kiểm tra giới hạn RAM và CPU đã áp dụng
-        run: |
-          docker inspect redroid \
-            --format "Memory: {{.HostConfig.Memory}} bytes | CPUs: {{.HostConfig.NanoCpus}} nanocpus"
-
-      # ─────────────────────────────────────────────
-      # 11. Kiểm tra GApps / Google Play
-      # ─────────────────────────────────────────────
-      - name: Kiểm tra Google Play Store
+      - name: Kiem tra Google Play Store
         run: |
           if adb -s localhost:5555 shell pm list packages 2>/dev/null | grep -q "com.android.vending"; then
-            echo "✅ Google Play Store (com.android.vending) đã cài."
+            echo "Google Play Store da cai."
           else
-            echo "⚠️ Không tìm thấy Google Play Store."
-            if [ "${{ github.event.inputs.gapps }}" = "y" ]; then
-              echo "::warning::GApps được chọn nhưng Play Store không có. Image có thể chưa init xong."
-              echo "Danh sách package hiện có:"
-              adb -s localhost:5555 shell pm list packages | head -30
-            fi
+            echo "Khong tim thay Google Play Store."
+            [ "${{ github.event.inputs.gapps }}" = "y" ] && echo "::warning::GApps duoc chon nhung Play Store khong co." && adb -s localhost:5555 shell pm list packages | head -30 || true
           fi
 
-      # ─────────────────────────────────────────────
-      # 12. Cài Brave (fallback nếu không có browser)
-      # ─────────────────────────────────────────────
-      - name: Cài trình duyệt Brave nếu chưa có browser
+      - name: Cai Brave neu chua co browser
         run: |
-          if adb -s localhost:5555 shell pm list packages 2>/dev/null \
-              | grep -qE "chrome|firefox|org\.mozilla|brave|com\.brave"; then
-            echo "✅ Đã có trình duyệt, bỏ qua."
+          if adb -s localhost:5555 shell pm list packages 2>/dev/null | grep -qE "chrome|firefox|brave"; then
+            echo "Da co trinh duyet."
           else
-            ARCH="${{ github.event.inputs.arch }}"
-            if [ "$ARCH" = "arm64" ]; then
-              # Native arm64 APK
-              BRAVE_URL="https://github.com/brave/brave-browser/releases/download/v1.93.132/Bravearm64Universal.apk"
-              BRAVE_APK="brave-arm64.apk"
-            else
-              # Universal APK hoạt động trên cả x86 qua NDK translation
-              BRAVE_URL="https://github.com/brave/brave-browser/releases/download/v1.93.132/Bravearm64Universal.apk"
-              BRAVE_APK="brave-universal.apk"
-            fi
-
-            echo "📥 Tải Brave APK ($ARCH)..."
-            curl -L "$BRAVE_URL" -o "$BRAVE_APK"
-            echo "sha256: $(sha256sum $BRAVE_APK | awk '{print $1}')"
-            file "$BRAVE_APK"
-
-            adb -s localhost:5555 install -r "$BRAVE_APK" \
-              && echo "✅ Brave installed" \
-              || echo "⚠️ Cài Brave thất bại, xem log ở trên."
+            curl -L "https://github.com/brave/brave-browser/releases/download/v1.93.132/Bravearm64Universal.apk" -o brave.apk
+            adb -s localhost:5555 install -r brave.apk && echo "Brave installed" || echo "Cai Brave that bai."
           fi
 
-      # ─────────────────────────────────────────────
-      # 13. Kiểm tra scrcpy-web
-      # ─────────────────────────────────────────────
-      - name: Kiểm tra scrcpy-web đã sẵn sàng
+      - name: Kiem tra scrcpy-web san sang
         run: |
           for i in $(seq 1 20); do
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000 || echo "000")
-            if [ "$HTTP_CODE" = "200" ]; then
-              echo "✅ scrcpy-web sẵn sàng tại http://localhost:8000"
-              break
-            fi
-            echo "Đợi scrcpy-web... ($i/20) [HTTP $HTTP_CODE]"
-            sleep 5
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000 || echo "000")
+            if [ "$CODE" = "200" ]; then echo "scrcpy-web san sang"; break; fi
+            echo "Doi... ($i/20) [$CODE]"; sleep 5
           done
 
-      # ─────────────────────────────────────────────
-      # 14. Upload server
-      # ─────────────────────────────────────────────
-      - name: Cài dependencies và chạy upload server
+      - name: Cai va chay upload server
         run: |
-          mkdir -p uploads
-          sudo chmod 777 uploads
+          mkdir -p uploads && sudo chmod 777 uploads
           mkdir -p upload-server && cd upload-server
           npm init -y >/dev/null 2>&1
           npm install express multer >/dev/null 2>&1
-
-          cat > server.js <<'JSEOF'
-const express = require('express');
-const multer  = require('multer');
-const { execFile } = require('child_process');
-const path = require('path');
-
-const app    = express();
-const upload = multer({ dest: path.join(__dirname, '../uploads') });
-
-app.get('/', (req, res) => {
-  res.send(`
-    <html><body style="font-family:sans-serif;padding:20px">
-    <h2>📤 Upload file vào máy ảo Android</h2>
-    <form method="POST" action="/upload" enctype="multipart/form-data">
-      <input type="file" name="files" multiple />
-      <button type="submit">Upload</button>
-    </form>
-    </body></html>
-  `);
-});
-
-app.post('/upload', upload.array('files'), (req, res) => {
-  const files = req.files || [];
-  if (files.length === 0)
-    return res.json({ success: false, message: 'Không có file nào' });
-
-  let done = 0;
-  const results = [];
-  files.forEach((f) => {
-    const dest = '/sdcard/Download/' + f.originalname;
-    execFile('adb', ['-s', 'localhost:5555', 'push', f.path, dest], (err) => {
-      results.push({ file: f.originalname, success: !err, error: err?.message ?? null });
-      done++;
-      if (done === files.length)
-        res.json({ success: results.every(r => r.success), results });
-    });
-  });
-});
-
-app.get('/list', (req, res) => res.json({ status: 'ok' }));
-
-app.listen(3000, () => console.log('Upload server chạy tại port 3000'));
-JSEOF
-
+          echo "Y29uc3QgZXhwcmVzcyA9IHJlcXVpcmUoJ2V4cHJlc3MnKTsKY29uc3QgbXVsdGVyICA9IHJlcXVpcmUoJ211bHRlcicpOwpjb25zdCB7IGV4ZWNGaWxlIH0gPSByZXF1aXJlKCdjaGlsZF9wcm9jZXNzJyk7CmNvbnN0IHBhdGggPSByZXF1aXJlKCdwYXRoJyk7Cgpjb25zdCBhcHAgICAgPSBleHByZXNzKCk7CmNvbnN0IHVwbG9hZCA9IG11bHRlcih7IGRlc3Q6IHBhdGguam9pbihfX2Rpcm5hbWUsICcuLi91cGxvYWRzJykgfSk7CgphcHAuZ2V0KCcvJywgKHJlcSwgcmVzKSA9PiB7CiAgcmVzLnNlbmQoYAogICAgPGh0bWw+PGJvZHkgc3R5bGU9ImZvbnQtZmFtaWx5OnNhbnMtc2VyaWY7cGFkZGluZzoyMHB4Ij4KICAgIDxoMj4mIzEyODIyODsgVXBsb2FkIGZpbGUgdmFvIG1heSBhbyBBbmRyb2lkPC9oMj4KICAgIDxmb3JtIG1ldGhvZD0iUE9TVCIgYWN0aW9uPSIvdXBsb2FkIiBlbmN0eXBlPSJtdWx0aXBhcnQvZm9ybS1kYXRhIj4KICAgICAgPGlucHV0IHR5cGU9ImZpbGUiIG5hbWU9ImZpbGVzIiBtdWx0aXBsZSAvPgogICAgICA8YnV0dG9uIHR5cGU9InN1Ym1pdCI+VXBsb2FkPC9idXR0b24+CiAgICA8L2Zvcm0+CiAgICA8L2JvZHk+PC9odG1sPgogIGApOwp9KTsKCmFwcC5wb3N0KCcvdXBsb2FkJywgdXBsb2FkLmFycmF5KCdmaWxlcycpLCAocmVxLCByZXMpID0+IHsKICBjb25zdCBmaWxlcyA9IHJlcS5maWxlcyB8fCBbXTsKICBpZiAoZmlsZXMubGVuZ3RoID09PSAwKQogICAgcmV0dXJuIHJlcy5qc29uKHsgc3VjY2VzczogZmFsc2UsIG1lc3NhZ2U6ICdLaG9uZyBjbyBmaWxlIG5hbycgfSk7CgogIGxldCBkb25lID0gMDsKICBjb25zdCByZXN1bHRzID0gW107CiAgZmlsZXMuZm9yRWFjaCgoZikgPT4gewogICAgY29uc3QgZGVzdCA9ICcvc2RjYXJkL0Rvd25sb2FkLycgKyBmLm9yaWdpbmFsbmFtZTsKICAgIGV4ZWNGaWxlKCdhZGInLCBbJy1zJywgJ2xvY2FsaG9zdDo1NTU1JywgJ3B1c2gnLCBmLnBhdGgsIGRlc3RdLCAoZXJyKSA9PiB7CiAgICAgIHJlc3VsdHMucHVzaCh7IGZpbGU6IGYub3JpZ2luYWxuYW1lLCBzdWNjZXNzOiAhZXJyLCBlcnJvcjogZXJyPy5tZXNzYWdlID8/IG51bGwgfSk7CiAgICAgIGRvbmUrKzsKICAgICAgaWYgKGRvbmUgPT09IGZpbGVzLmxlbmd0aCkKICAgICAgICByZXMuanNvbih7IHN1Y2Nlc3M6IHJlc3VsdHMuZXZlcnkociA9PiByLnN1Y2Nlc3MpLCByZXN1bHRzIH0pOwogICAgfSk7CiAgfSk7Cn0pOwoKYXBwLmdldCgnL2xpc3QnLCAocmVxLCByZXMpID0+IHJlcy5qc29uKHsgc3RhdHVzOiAnb2snIH0pKTsKCmFwcC5saXN0ZW4oMzAwMCwgKCkgPT4gY29uc29sZS5sb2coJ1VwbG9hZCBzZXJ2ZXIgY2hheSB0YWkgcG9ydCAzMDAwJykpOwo=" | base64 -d > server.js
           cd ..
           nohup node upload-server/server.js > upload-server.log 2>&1 &
           disown
           sleep 5
-          if curl -s http://localhost:3000/list > /dev/null; then
-            echo "✅ Upload server đang chạy"
-          else
-            echo "❌ Upload server không khởi động:"
-            cat upload-server.log
-          fi
+          curl -s http://localhost:3000/list > /dev/null && echo "Upload server OK" || cat upload-server.log
 
-      # ─────────────────────────────────────────────
-      # 15. Cloudflare Tunnel
-      #     Dùng đúng binary theo arch đã tính ở step 0
-      # ─────────────────────────────────────────────
-      - name: Cài Cloudflare Tunnel (có watchdog tự reconnect)
+      - name: Cai Cloudflare Tunnel (co watchdog)
         run: |
-          echo "📥 Tải cloudflared binary: ${CLOUDFLARED_BIN}"
-          curl -L "https://github.com/cloudflare/cloudflared/releases/latest/download/${CLOUDFLARED_BIN}" \
-            -o cloudflared
-          chmod +x cloudflared
-          sudo mv cloudflared /usr/local/bin/
-
+          curl -L "https://github.com/cloudflare/cloudflared/releases/latest/download/${CLOUDFLARED_BIN}" -o cloudflared
+          chmod +x cloudflared && sudo mv cloudflared /usr/local/bin/
           pkill cloudflared || true
-          > cloudflared.log
-          > cloudflared-upload.log
-
-          nohup cloudflared tunnel --url http://localhost:8000 >> cloudflared.log 2>&1 &
-          disown
-          nohup cloudflared tunnel --url http://localhost:3000 >> cloudflared-upload.log 2>&1 &
-          disown
-
-          echo "Đợi tunnel khởi tạo..."
-          URL=""
+          > cloudflared.log && > cloudflared-upload.log
+          nohup cloudflared tunnel --url http://localhost:8000 >> cloudflared.log 2>&1 & disown
+          nohup cloudflared tunnel --url http://localhost:3000 >> cloudflared-upload.log 2>&1 & disown
           for i in $(seq 1 20); do
             sleep 3
-            URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cloudflared.log | head -n1 || true)
-            if [ -n "$URL" ]; then
-              echo "✅ Tunnel chính: $URL"
-              echo "TUNNEL_URL=$URL" >> $GITHUB_ENV
-              break
-            fi
+            URL=$(grep -o "https://[a-zA-Z0-9.-]*\.trycloudflare\.com" cloudflared.log | head -n1 || true)
+            if [ -n "$URL" ]; then echo "Tunnel chinh: $URL"; echo "TUNNEL_URL=$URL" >> $GITHUB_ENV; break; fi
           done
-
-          UPLOAD_URL=""
           for i in $(seq 1 20); do
             sleep 2
-            UPLOAD_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' \
-              cloudflared-upload.log | head -n1 || true)
-            if [ -n "$UPLOAD_URL" ]; then
-              echo "✅ Tunnel upload: $UPLOAD_URL"
-              echo "UPLOAD_URL=$UPLOAD_URL" >> $GITHUB_ENV
-              break
-            fi
+            UP=$(grep -o "https://[a-zA-Z0-9.-]*\.trycloudflare\.com" cloudflared-upload.log | head -n1 || true)
+            if [ -n "$UP" ]; then echo "Tunnel upload: $UP"; echo "UPLOAD_URL=$UP" >> $GITHUB_ENV; break; fi
           done
-
-          cat cloudflared.log
-
-          # Watchdog nền: tự restart nếu tunnel chết
-          nohup bash -c '
-            while true; do
-              sleep 15
-              pgrep -f "cloudflared tunnel --url http://localhost:8000" > /dev/null || {
-                echo "[watchdog] tunnel chính chết, restart..." >> cloudflared.log
-                nohup cloudflared tunnel --url http://localhost:8000 >> cloudflared.log 2>&1 &
-              }
-              pgrep -f "cloudflared tunnel --url http://localhost:3000" > /dev/null || {
-                echo "[watchdog] tunnel upload chết, restart..." >> cloudflared-upload.log
-                nohup cloudflared tunnel --url http://localhost:3000 >> cloudflared-upload.log 2>&1 &
-              }
-            done
-          ' > cloudflared-watchdog.log 2>&1 &
+          echo "d2hpbGUgdHJ1ZTsgZG8gc2xlZXAgMTU7IHBncmVwIC1mICdjbG91ZGZsYXJlZCB0dW5uZWwgLS11cmwgaHR0cDovL2xvY2FsaG9zdDo4MDAwJyA+IC9kZXYvbnVsbCB8fCBub2h1cCBjbG91ZGZsYXJlZCB0dW5uZWwgLS11cmwgaHR0cDovL2xvY2FsaG9zdDo4MDAwID4+IGNsb3VkZmxhcmVkLmxvZyAyPiYxICYgcGdyZXAgLWYgJ2Nsb3VkZmxhcmVkIHR1bm5lbCAtLXVybCBodHRwOi8vbG9jYWxob3N0OjMwMDAnID4gL2Rldi9udWxsIHx8IG5vaHVwIGNsb3VkZmxhcmVkIHR1bm5lbCAtLXVybCBodHRwOi8vbG9jYWxob3N0OjMwMDAgPj4gY2xvdWRmbGFyZWQtdXBsb2FkLmxvZyAyPiYxICYgZG9uZQ==" | base64 -d | nohup bash > cloudflared-watchdog.log 2>&1 &
           disown
 
-      # ─────────────────────────────────────────────
-      # 16. Hướng dẫn sử dụng
-      # ─────────────────────────────────────────────
-      - name: In hướng dẫn sử dụng
+      - name: In huong dan su dung
         run: |
           echo "=========================================="
-          echo "📱 Truy cập Android của bạn tại:"
-          echo "   ${TUNNEL_URL}"
-          echo "📤 Upload file tại:"
-          echo "   ${UPLOAD_URL}"
-          echo ""
-          echo "🤖 Android ${ANDROID_VER} | GApps: ${{ github.event.inputs.gapps }} | Root: ${{ github.event.inputs.root }}"
-          echo "🏗️  Arch: ${{ github.event.inputs.arch }} | RAM: ${{ github.event.inputs.ram_gb }}GB | CPU: ${CPU_LIMIT} core"
-          echo "💾 Lưu dữ liệu: ${{ github.event.inputs.save_data }}"
-          echo "🐳 Image: ${IMAGE_TAG}"
+          echo "Android ${{ github.event.inputs.android_version }} | GApps: ${{ github.event.inputs.gapps }} | Root: ${{ github.event.inputs.root }}"
+          echo "Arch: ${{ github.event.inputs.arch }} | RAM: ${{ github.event.inputs.ram_gb }}GB | CPU: ${CPU_LIMIT}"
+          echo "Image: ${IMAGE_TAG}"
+          echo "scrcpy: ${TUNNEL_URL:-chua co}"
+          echo "Upload: ${UPLOAD_URL:-chua co}"
           echo "=========================================="
 
-      # ─────────────────────────────────────────────
-      # 17. Keepalive 340 phút
-      # ─────────────────────────────────────────────
-      - name: Giữ job chạy trong 340 phút
+      - name: Giu job chay trong 340 phut
         run: |
           END=$((SECONDS + 340*60))
-          LAST_URL=""
-          LAST_UPLOAD_URL=""
+          LAST_URL="" LAST_UP=""
           while [ $SECONDS -lt $END ]; do
             sleep 60
-            CUR_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' \
-              cloudflared.log | tail -n1 || true)
-            if [ -n "$CUR_URL" ] && [ "$CUR_URL" != "$LAST_URL" ]; then
-              echo "🔄 URL scrcpy hiện tại: $CUR_URL"
-              LAST_URL="$CUR_URL"
-            fi
-            CUR_UPLOAD=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' \
-              cloudflared-upload.log | tail -n1 || true)
-            if [ -n "$CUR_UPLOAD" ] && [ "$CUR_UPLOAD" != "$LAST_UPLOAD_URL" ]; then
-              echo "🔄 URL upload hiện tại: $CUR_UPLOAD"
-              LAST_UPLOAD_URL="$CUR_UPLOAD"
-            fi
+            CUR=$(grep -o "https://[a-zA-Z0-9.-]*\.trycloudflare\.com" cloudflared.log | tail -n1 || true)
+            [ -n "$CUR" ] && [ "$CUR" != "$LAST_URL" ] && echo "scrcpy: $CUR" && LAST_URL="$CUR"
+            CUR_UP=$(grep -o "https://[a-zA-Z0-9.-]*\.trycloudflare\.com" cloudflared-upload.log | tail -n1 || true)
+            [ -n "$CUR_UP" ] && [ "$CUR_UP" != "$LAST_UP" ] && echo "upload: $CUR_UP" && LAST_UP="$CUR_UP"
             echo "alive $(date)"
           done
