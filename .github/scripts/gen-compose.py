@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Tao docker-compose.yml cho Redroid + ws-scrcpy.
+Tao docker-compose.yml cho Redroid (image chinh chu redroid/redroid) + ws-scrcpy.
 Doc cac bien moi truong duoc set boi workflow truoc khi goi script nay.
 """
 import os
@@ -13,8 +13,27 @@ abilist64     = os.environ['ABILIST64']
 abilist32     = os.environ['ABILIST32']
 ndk           = os.environ.get('NDK_TRANSLATION', '')
 
-# Dong NDK chi xuat hien neu chay tren host amd64
 ndk_line = f'      - {ndk}\n' if ndk else ''
+
+# QUAN TRONG: entrypoint cua custom-ws-scrcpy dung bien shell $i, $(...).
+# docker-compose tu lam bien the ${VAR} trong file compose truoc khi Docker
+# thay - neu khong escape thanh $$ thi "$i" bi hieu la bien compose "i"
+# (khong ton tai) va bi thay bang chuoi rong, gay ra warning
+# "The 'i' variable is not set" va entrypoint chay sai.
+# Escape moi $ thanh $$ trong entrypoint.
+
+entrypoint_script = (
+    "adb start-server && "
+    "for i in $$(seq 1 30); do "
+    "adb connect redroid:5555 | grep -q connected && break; "
+    "echo retry $$i...; sleep 5; "
+    "done && "
+    "( while true; do "
+    "sleep 10; "
+    "adb devices | grep -q 'redroid:5555.*device' || adb connect redroid:5555; "
+    "done ) & "
+    "npm start"
+)
 
 compose = f"""services:
   redroid:
@@ -28,11 +47,10 @@ compose = f"""services:
       - "5555:5555"
     volumes:
       - ./data:/data
-    environment:
-      - REDROID_WIDTH=720
-      - REDROID_HEIGHT=1280
-      - REDROID_FPS=30
     command:
+      - androidboot.redroid_width=720
+      - androidboot.redroid_height=1280
+      - androidboot.redroid_fps=30
       - ro.product.cpu.abilist={abilist}
       - ro.product.cpu.abilist64={abilist64}
       - ro.product.cpu.abilist32={abilist32}
@@ -53,17 +71,7 @@ compose = f"""services:
     entrypoint:
       - sh
       - -c
-      - >-
-        adb start-server &&
-        for i in $(seq 1 30); do
-          adb connect redroid:5555 | grep -q connected && break;
-          echo "retry $i..."; sleep 5;
-        done &&
-        ( while true; do
-            sleep 10;
-            adb devices | grep -q 'redroid:5555.*device' || adb connect redroid:5555;
-          done ) &
-        npm start
+      - "{entrypoint_script}"
 """
 
 with open('docker-compose.yml', 'w') as f:
