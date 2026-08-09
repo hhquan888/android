@@ -1,4 +1,4 @@
-name: CloudPhone with Redroid and scrcpy-web (Android 12)
+name: CloudPhone
 
 on:
   workflow_dispatch:
