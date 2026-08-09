@@ -1,0 +1,311 @@
+name: CloudPhone with Redroid and scrcpy-web (Android 12)
+
+on:
+  workflow_dispatch:
+    inputs:
+      gapps:
+        description: "Install Google Play (GApps)?"
+        required: true
+        default: "y"
+        type: choice
+        options:
+          - "y"
+          - "n"
+      root:
+        description: "Keep ADB root after the device finishes booting?"
+        required: true
+        default: "0"
+        type: choice
+        options:
+          - "0"
+          - "1"
+      arch:
+        description: "Runner architecture (arm64 / amd64)"
+        required: true
+        default: "amd64"
+        type: choice
+        options:
+          - "amd64"
+          - "arm64"
+      ram_gb:
+        description: "RAM limit for the virtual device (GB)"
+        required: true
+        default: "4"
+        type: choice
+        options:
+          - "2"
+          - "4"
+          - "8"
+          - "12"
+      save_data:
+        description: "Persist device data across runs? y=persist n=fresh each time"
+        required: true
+        default: "n"
+        type: choice
+        options:
+          - "y"
+          - "n"
+
+jobs:
+  cloudphone:
+    runs-on: ${{ github.event.inputs.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Compute Redroid image + architecture variables
+        run: |
+          ARCH="${{ github.event.inputs.arch }}"
+          RAM="${{ github.event.inputs.ram_gb }}"
+
+          # Fixed to Android 12. Official redroid/redroid image, "-latest"
+          # tag is a real, verified multi-arch manifest (amd64 + arm64) -
+          # Docker picks the right platform automatically. No arch suffix
+          # in the tag - that was the bug that caused "manifest unknown"
+          # in the previous runs.
+          IMAGE_TAG="redroid/redroid:12.0.0-latest"
+
+          if [ "$ARCH" = "arm64" ]; then
+            ABILIST="arm64-v8a,armeabi-v7a,armeabi"
+            ABILIST64="arm64-v8a"
+            ABILIST32="armeabi-v7a,armeabi"
+            NDK_TRANSLATION=""
+            CLOUDFLARED_BIN="cloudflared-linux-arm64"
+          else
+            ABILIST="x86_64,x86,arm64-v8a,armeabi-v7a,armeabi"
+            ABILIST64="x86_64,arm64-v8a"
+            ABILIST32="x86,armeabi-v7a,armeabi"
+            NDK_TRANSLATION="ro.dalvik.vm.native.bridge=libndk_translation.so"
+            CLOUDFLARED_BIN="cloudflared-linux-amd64"
+          fi
+
+          CPU_COUNT=$(nproc)
+          if [ "$CPU_COUNT" -ge 4 ]; then CPU_LIMIT=4; else CPU_LIMIT=$CPU_COUNT; fi
+
+          echo "IMAGE_TAG=$IMAGE_TAG"             >> $GITHUB_ENV
+          echo "ABILIST=$ABILIST"                 >> $GITHUB_ENV
+          echo "ABILIST64=$ABILIST64"             >> $GITHUB_ENV
+          echo "ABILIST32=$ABILIST32"             >> $GITHUB_ENV
+          echo "NDK_TRANSLATION=$NDK_TRANSLATION" >> $GITHUB_ENV
+          echo "CLOUDFLARED_BIN=$CLOUDFLARED_BIN" >> $GITHUB_ENV
+          echo "CPU_LIMIT=$CPU_LIMIT"             >> $GITHUB_ENV
+          echo "RAM_GB=$RAM"                      >> $GITHUB_ENV
+
+          echo "Image: $IMAGE_TAG | ABI: $ABILIST | NDK: ${NDK_TRANSLATION:-none} | CF: $CLOUDFLARED_BIN | CPU: $CPU_LIMIT"
+
+      - name: Restore device data (if persistence enabled)
+        if: ${{ github.event.inputs.save_data == 'y' }}
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: cloudphone-data-android12-${{ github.event.inputs.arch }}
+          restore-keys: |
+            cloudphone-data-android12-${{ github.event.inputs.arch }}
+
+      - name: Install required tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y android-tools-adb curl
+          sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" \
+            -o /usr/local/bin/docker-compose
+          sudo chmod +x /usr/local/bin/docker-compose
+          docker-compose --version
+
+      - name: Load binder kernel modules
+        run: |
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
+          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder" \
+            || sudo modprobe binderfs \
+            || echo "::warning::binder module failed to load"
+          sudo modprobe ashmem_linux || true
+          lsmod | grep -E "binder|ashmem" || echo "(no matching module found)"
+
+      - name: Fetch ws-scrcpy and prepare Dockerfile
+        run: |
+          mkdir -p ws-scrcpy-build
+          curl -L "https://github.com/hhquan888/ws-scrcpy/releases/download/1.0/ws-scrcpy-dist.zip" \
+            -o ws-scrcpy-dist.zip
+          EXPECTED="5fedd7aa159a7696689cf943abc4c080518bab2b44d94cf5ebe3bf585a540d24"
+          ACTUAL=$(sha256sum ws-scrcpy-dist.zip | awk '{print $1}')
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "sha256 MISMATCH: $ACTUAL"
+            exit 1
+          fi
+          unzip -o ws-scrcpy-dist.zip -d ws-scrcpy-build
+          cp .github/scripts/Dockerfile.scrcpy ws-scrcpy-build/Dockerfile
+          cat ws-scrcpy-build/Dockerfile
+
+      - name: Generate docker-compose.yml
+        run: |
+          mkdir -p data
+          python3 .github/scripts/gen-compose.py
+          echo "=== docker-compose.yml ==="
+          cat docker-compose.yml
+
+      - name: Pull Redroid image and build ws-scrcpy image
+        run: |
+          # Pull the pullable image and build the local one separately.
+          # This avoids docker-compose's default "pull everything with an
+          # image: key first" behaviour, which was trying to pull
+          # custom-ws-scrcpy from Docker Hub (where it does not exist)
+          # instead of building it locally.
+          docker-compose pull redroid
+          docker-compose build custom-ws-scrcpy
+
+      - name: Start Redroid and scrcpy-web
+        run: |
+          docker-compose up -d --no-build
+          echo "Waiting for containers to start (30s)..."
+          sleep 30
+          docker ps -a
+
+      - name: "[DIAGNOSTICS] Log all containers"
+        run: |
+          for name in $(docker ps -a --format '{{.Names}}'); do
+            echo "===== $name ====="
+            docker logs "$name" 2>&1 | tail -n 100
+            docker inspect "$name" --format "$name: {{.State.Status}} (restarts: {{.RestartCount}})"
+          done
+
+      - name: Check ADB connection and boot completion
+        run: |
+          adb connect localhost:5555 || true
+          adb devices -l
+          for i in $(seq 1 36); do
+            BOOTED=$(adb -s localhost:5555 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
+            if [ "$BOOTED" = "1" ]; then echo "Android finished booting!"; break; fi
+            echo "Waiting for boot... ($i/36)"
+            sleep 10
+          done
+          STATE=$(adb -s localhost:5555 get-state 2>/dev/null || echo "unknown")
+          echo "ADB state: $STATE"
+          [ "$STATE" != "device" ] && echo "::warning::ADB is not in device state" || true
+
+      - name: Install GApps (MindTheGapps, Android 12)
+        if: ${{ github.event.inputs.gapps == 'y' }}
+        run: |
+          chmod +x .github/scripts/install-gapps.sh
+          .github/scripts/install-gapps.sh "12"
+
+      - name: Enable/disable ADB root per selection
+        run: |
+          if [ "${{ github.event.inputs.root }}" = "1" ]; then
+            adb -s localhost:5555 root
+            sleep 3
+            adb connect localhost:5555 || true
+            echo "ADB is running in root mode."
+          else
+            adb -s localhost:5555 unroot 2>/dev/null || true
+            echo "ADB is running in non-root mode (default)."
+          fi
+          adb -s localhost:5555 shell whoami
+
+      - name: Check abilist and system info
+        run: |
+          adb -s localhost:5555 shell getprop ro.product.cpu.abilist
+          adb -s localhost:5555 shell getprop ro.build.version.release
+          adb -s localhost:5555 shell getprop ro.dalvik.vm.native.bridge || echo "(none)"
+          adb -s localhost:5555 shell cat /proc/meminfo | head -n 3
+          docker inspect redroid --format "Memory: {{.HostConfig.Memory}} | CPUs: {{.HostConfig.NanoCpus}}"
+
+      - name: Check Google Play Store
+        run: |
+          if adb -s localhost:5555 shell pm list packages 2>/dev/null | grep -q "com.android.vending"; then
+            echo "Google Play Store is installed."
+          else
+            echo "No Google Play Store (expected if gapps=n)."
+          fi
+
+      - name: Install Brave if no browser is present
+        run: |
+          if adb -s localhost:5555 shell pm list packages 2>/dev/null | grep -qE "chrome|firefox|brave"; then
+            echo "Browser already present, skipping."
+          else
+            curl -L "https://github.com/brave/brave-browser/releases/download/v1.93.132/Bravearm64Universal.apk" \
+              -o brave.apk
+            adb -s localhost:5555 install -r brave.apk && echo "Brave installed" || echo "Brave install failed."
+          fi
+
+      - name: Check scrcpy-web readiness
+        run: |
+          for i in $(seq 1 20); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000 || echo "000")
+            if [ "$CODE" = "200" ]; then echo "scrcpy-web is ready"; break; fi
+            echo "Waiting for scrcpy-web... ($i/20) [HTTP $CODE]"
+            sleep 5
+          done
+
+      - name: Install and start upload server
+        run: |
+          mkdir -p uploads && sudo chmod 777 uploads
+          mkdir -p upload-server
+          cd upload-server
+          npm init -y >/dev/null 2>&1
+          npm install express multer >/dev/null 2>&1
+          cp ../.github/scripts/upload-server.js server.js
+          cd ..
+          nohup node upload-server/server.js > upload-server.log 2>&1 &
+          disown
+          sleep 5
+          curl -s http://localhost:3000/list > /dev/null && echo "Upload server OK" || cat upload-server.log
+
+      - name: Install Cloudflare Tunnel (with watchdog)
+        run: |
+          curl -L "https://github.com/cloudflare/cloudflared/releases/latest/download/${CLOUDFLARED_BIN}" \
+            -o cloudflared
+          chmod +x cloudflared && sudo mv cloudflared /usr/local/bin/
+          pkill cloudflared || true
+          > cloudflared.log
+          > cloudflared-upload.log
+
+          nohup cloudflared tunnel --url http://localhost:8000 >> cloudflared.log 2>&1 &
+          disown
+          nohup cloudflared tunnel --url http://localhost:3000 >> cloudflared-upload.log 2>&1 &
+          disown
+
+          for i in $(seq 1 20); do
+            sleep 3
+            URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cloudflared.log | head -n1 || true)
+            if [ -n "$URL" ]; then echo "Main tunnel: $URL"; echo "TUNNEL_URL=$URL" >> $GITHUB_ENV; break; fi
+          done
+          for i in $(seq 1 20); do
+            sleep 2
+            UP=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cloudflared-upload.log | head -n1 || true)
+            if [ -n "$UP" ]; then echo "Upload tunnel: $UP"; echo "UPLOAD_URL=$UP" >> $GITHUB_ENV; break; fi
+          done
+
+          chmod +x .github/scripts/cf-watchdog.sh
+          nohup .github/scripts/cf-watchdog.sh > cloudflared-watchdog.log 2>&1 &
+          disown
+
+      - name: Print usage instructions
+        run: |
+          echo "=========================================="
+          echo "Android 12 | GApps: ${{ github.event.inputs.gapps }} | Root: ${{ github.event.inputs.root }}"
+          echo "Arch: ${{ github.event.inputs.arch }} | RAM: ${{ github.event.inputs.ram_gb }}GB | CPU: ${CPU_LIMIT}"
+          echo "Image: ${IMAGE_TAG}"
+          echo "scrcpy: ${TUNNEL_URL:-not available}"
+          echo "Upload: ${UPLOAD_URL:-not available}"
+          echo "=========================================="
+
+      - name: Keep job running for 340 minutes
+        run: |
+          END=$((SECONDS + 340*60))
+          LAST_URL=""
+          LAST_UP=""
+          while [ $SECONDS -lt $END ]; do
+            sleep 60
+            CUR=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cloudflared.log | tail -n1 || true)
+            if [ -n "$CUR" ] && [ "$CUR" != "$LAST_URL" ]; then
+              echo "scrcpy URL: $CUR"
+              LAST_URL="$CUR"
+            fi
+            CUR_UP=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cloudflared-upload.log | tail -n1 || true)
+            if [ -n "$CUR_UP" ] && [ "$CUR_UP" != "$LAST_UP" ]; then
+              echo "upload URL: $CUR_UP"
+              LAST_UP="$CUR_UP"
+            fi
+            echo "alive $(date)"
+          done
