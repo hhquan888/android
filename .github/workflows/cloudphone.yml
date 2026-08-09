@@ -1,4 +1,4 @@
-name: Cloudphone
+name: CloudPhone with Redroid and scrcpy-web (Android 12, arm64)
 
 on:
   workflow_dispatch:
@@ -219,6 +219,19 @@ jobs:
               -o brave.apk
             adb -s localhost:5555 install -r brave.apk && echo "Brave installed" || echo "Brave install failed."
           fi
+
+      - name: Disable GPU compositing for Chromium-based browsers
+        run: |
+          # This GitHub Actions runner has no /dev/dri, no KVM+virgl GPU
+          # passthrough. Redroid falls back to software rendering, but any
+          # Chromium engine (Brave, Chrome, Edge) still tries GPU compositing
+          # on launch and crashes immediately without these flags.
+          # chrome-command-line is the standard Chromium debug flag file,
+          # read on startup by any userdebug-build Android system (which
+          # Redroid is) or any debuggable app.
+          adb -s localhost:5555 shell "echo '_ --disable-gpu --disable-gpu-compositing --disable-software-rasterizer --disable-accelerated-2d-canvas --disable-accelerated-video-decode' > /data/local/tmp/chrome-command-line"
+          adb -s localhost:5555 shell chmod 644 /data/local/tmp/chrome-command-line
+          adb -s localhost:5555 shell cat /data/local/tmp/chrome-command-line
 
       - name: Check scrcpy-web readiness
         run: |
