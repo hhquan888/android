@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Watchdog: tu dong restart cloudflared tunnel neu chet
+# Watchdog: automatically restarts cloudflared tunnel if it dies
 while true; do
   sleep 15
   pgrep -f 'cloudflared tunnel --url http://localhost:8000' > /dev/null || \

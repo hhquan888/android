@@ -9,7 +9,7 @@ const upload = multer({ dest: path.join(__dirname, '../uploads') });
 app.get('/', (req, res) => {
   res.send(`
     <html><body style="font-family:sans-serif;padding:20px">
-    <h2>&#128228; Upload file vao may ao Android</h2>
+    <h2>Upload files to Android device</h2>
     <form method="POST" action="/upload" enctype="multipart/form-data">
       <input type="file" name="files" multiple />
       <button type="submit">Upload</button>
@@ -21,7 +21,7 @@ app.get('/', (req, res) => {
 app.post('/upload', upload.array('files'), (req, res) => {
   const files = req.files || [];
   if (files.length === 0)
-    return res.json({ success: false, message: 'Khong co file nao' });
+    return res.json({ success: false, message: 'No files provided' });
 
   let done = 0;
   const results = [];
@@ -38,4 +38,4 @@ app.post('/upload', upload.array('files'), (req, res) => {
 
 app.get('/list', (req, res) => res.json({ status: 'ok' }));
 
-app.listen(3000, () => console.log('Upload server chay tai port 3000'));
+app.listen(3000, () => console.log('Upload server running on port 3000'));
