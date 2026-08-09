@@ -1,4 +1,4 @@
-name: CloudPhone
+name: Cloudphone
 
 on:
   workflow_dispatch:
@@ -19,14 +19,6 @@ on:
         options:
           - "0"
           - "1"
-      arch:
-        description: "Runner architecture (arm64 / amd64)"
-        required: true
-        default: "amd64"
-        type: choice
-        options:
-          - "amd64"
-          - "arm64"
       ram_gb:
         description: "RAM limit for the virtual device (GB)"
         required: true
@@ -48,38 +40,27 @@ on:
 
 jobs:
   cloudphone:
-    runs-on: ${{ github.event.inputs.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 350
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Compute Redroid image + architecture variables
+      - name: Compute Redroid image variables
         run: |
-          ARCH="${{ github.event.inputs.arch }}"
           RAM="${{ github.event.inputs.ram_gb }}"
 
-          # Fixed to Android 12. Official redroid/redroid image, "-latest"
-          # tag is a real, verified multi-arch manifest (amd64 + arm64) -
-          # Docker picks the right platform automatically. No arch suffix
-          # in the tag - that was the bug that caused "manifest unknown"
-          # in the previous runs.
+          # Fixed to Android 12, arm64 only. Official redroid/redroid image,
+          # "-latest" tag is a real, verified multi-arch manifest - Docker
+          # picks arm64 automatically on this runner.
           IMAGE_TAG="redroid/redroid:12.0.0-latest"
 
-          if [ "$ARCH" = "arm64" ]; then
-            ABILIST="arm64-v8a,armeabi-v7a,armeabi"
-            ABILIST64="arm64-v8a"
-            ABILIST32="armeabi-v7a,armeabi"
-            NDK_TRANSLATION=""
-            CLOUDFLARED_BIN="cloudflared-linux-arm64"
-          else
-            ABILIST="x86_64,x86,arm64-v8a,armeabi-v7a,armeabi"
-            ABILIST64="x86_64,arm64-v8a"
-            ABILIST32="x86,armeabi-v7a,armeabi"
-            NDK_TRANSLATION="ro.dalvik.vm.native.bridge=libndk_translation.so"
-            CLOUDFLARED_BIN="cloudflared-linux-amd64"
-          fi
+          # arm64 host runs ARM apps natively - no NDK translation needed.
+          ABILIST="arm64-v8a,armeabi-v7a,armeabi"
+          ABILIST64="arm64-v8a"
+          ABILIST32="armeabi-v7a,armeabi"
+          CLOUDFLARED_BIN="cloudflared-linux-arm64"
 
           CPU_COUNT=$(nproc)
           if [ "$CPU_COUNT" -ge 4 ]; then CPU_LIMIT=4; else CPU_LIMIT=$CPU_COUNT; fi
@@ -88,21 +69,20 @@ jobs:
           echo "ABILIST=$ABILIST"                 >> $GITHUB_ENV
           echo "ABILIST64=$ABILIST64"             >> $GITHUB_ENV
           echo "ABILIST32=$ABILIST32"             >> $GITHUB_ENV
-          echo "NDK_TRANSLATION=$NDK_TRANSLATION" >> $GITHUB_ENV
           echo "CLOUDFLARED_BIN=$CLOUDFLARED_BIN" >> $GITHUB_ENV
           echo "CPU_LIMIT=$CPU_LIMIT"             >> $GITHUB_ENV
           echo "RAM_GB=$RAM"                      >> $GITHUB_ENV
 
-          echo "Image: $IMAGE_TAG | ABI: $ABILIST | NDK: ${NDK_TRANSLATION:-none} | CF: $CLOUDFLARED_BIN | CPU: $CPU_LIMIT"
+          echo "Image: $IMAGE_TAG | ABI: $ABILIST | CF: $CLOUDFLARED_BIN | CPU: $CPU_LIMIT"
 
       - name: Restore device data (if persistence enabled)
         if: ${{ github.event.inputs.save_data == 'y' }}
         uses: actions/cache@v4
         with:
           path: data
-          key: cloudphone-data-android12-${{ github.event.inputs.arch }}
+          key: cloudphone-data-android12-arm64
           restore-keys: |
-            cloudphone-data-android12-${{ github.event.inputs.arch }}
+            cloudphone-data-android12-arm64
 
       - name: Install required tools
         run: |
@@ -146,11 +126,6 @@ jobs:
 
       - name: Pull Redroid image and build ws-scrcpy image
         run: |
-          # Pull the pullable image and build the local one separately.
-          # This avoids docker-compose's default "pull everything with an
-          # image: key first" behaviour, which was trying to pull
-          # custom-ws-scrcpy from Docker Hub (where it does not exist)
-          # instead of building it locally.
           docker-compose pull redroid
           docker-compose build custom-ws-scrcpy
 
@@ -191,22 +166,39 @@ jobs:
 
       - name: Enable/disable ADB root per selection
         run: |
+          # adbd restarts on the device whenever root mode is toggled
+          # (root or unroot) - this always drops the TCP connection
+          # momentarily. Both branches must wait-for-device and
+          # reconnect before running any further adb shell command,
+          # or "device offline" follows.
           if [ "${{ github.event.inputs.root }}" = "1" ]; then
             adb -s localhost:5555 root
-            sleep 3
-            adb connect localhost:5555 || true
-            echo "ADB is running in root mode."
+            echo "Requested root mode."
           else
-            adb -s localhost:5555 unroot 2>/dev/null || true
-            echo "ADB is running in non-root mode (default)."
+            adb -s localhost:5555 unroot
+            echo "Requested non-root mode (default)."
           fi
-          adb -s localhost:5555 shell whoami
+
+          sleep 3
+          adb connect localhost:5555 || true
+          adb -s localhost:5555 wait-for-device
+
+          # wait-for-device can return before adbd is actually ready to
+          # answer shell commands - poll a real shell command with retries
+          # instead of trusting wait-for-device alone.
+          for i in $(seq 1 15); do
+            if adb -s localhost:5555 shell whoami 2>/dev/null; then
+              break
+            fi
+            echo "adb not ready yet, retrying... ($i/15)"
+            sleep 2
+            adb connect localhost:5555 || true
+          done
 
       - name: Check abilist and system info
         run: |
           adb -s localhost:5555 shell getprop ro.product.cpu.abilist
           adb -s localhost:5555 shell getprop ro.build.version.release
-          adb -s localhost:5555 shell getprop ro.dalvik.vm.native.bridge || echo "(none)"
           adb -s localhost:5555 shell cat /proc/meminfo | head -n 3
           docker inspect redroid --format "Memory: {{.HostConfig.Memory}} | CPUs: {{.HostConfig.NanoCpus}}"
 
@@ -283,8 +275,8 @@ jobs:
       - name: Print usage instructions
         run: |
           echo "=========================================="
-          echo "Android 12 | GApps: ${{ github.event.inputs.gapps }} | Root: ${{ github.event.inputs.root }}"
-          echo "Arch: ${{ github.event.inputs.arch }} | RAM: ${{ github.event.inputs.ram_gb }}GB | CPU: ${CPU_LIMIT}"
+          echo "Android 12 (arm64) | GApps: ${{ github.event.inputs.gapps }} | Root: ${{ github.event.inputs.root }}"
+          echo "RAM: ${{ github.event.inputs.ram_gb }}GB | CPU: ${CPU_LIMIT}"
           echo "Image: ${IMAGE_TAG}"
           echo "scrcpy: ${TUNNEL_URL:-not available}"
           echo "Upload: ${UPLOAD_URL:-not available}"
