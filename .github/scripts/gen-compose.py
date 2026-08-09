@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Tao docker-compose.yml cho Redroid (image chinh chu redroid/redroid, Android 12)
-+ ws-scrcpy. Doc bien moi truong duoc set boi workflow truoc khi goi script nay.
+Generate docker-compose.yml for Redroid (official redroid/redroid image,
+Android 12, arm64 only) + ws-scrcpy. Reads env vars set by the workflow
+before calling this script.
 """
 import os
 
@@ -11,13 +12,11 @@ cpu_limit = os.environ['CPU_LIMIT']
 abilist   = os.environ['ABILIST']
 abilist64 = os.environ['ABILIST64']
 abilist32 = os.environ['ABILIST32']
-ndk       = os.environ.get('NDK_TRANSLATION', '')
 
-ndk_line = f'      - {ndk}\n' if ndk else ''
-
-# QUAN TRONG: entrypoint dung bien shell $i, $(...). docker-compose tu lam
-# bien the ${VAR} truoc khi Docker thay - phai escape thanh $$ de tranh loi
-# "The 'i' variable is not set".
+# IMPORTANT: the entrypoint uses shell variables $i, $(...). docker-compose
+# interpolates ${VAR} in compose files before Docker sees it - must escape
+# as $$ or it silently becomes an empty string ("The 'i' variable is not
+# set" warning) and the entrypoint runs wrong.
 entrypoint_script = (
     "adb start-server && "
     "for i in $$(seq 1 30); do "
@@ -50,7 +49,7 @@ compose = f"""services:
       - ro.product.cpu.abilist={abilist}
       - ro.product.cpu.abilist64={abilist64}
       - ro.product.cpu.abilist32={abilist32}
-{ndk_line}    restart: unless-stopped
+    restart: unless-stopped
 
   custom-ws-scrcpy:
     container_name: custom-ws-scrcpy
@@ -79,4 +78,3 @@ print(f'  image: {image_tag}')
 print(f'  ram:   {ram_gb}g')
 print(f'  cpu:   {cpu_limit}')
 print(f'  abi:   {abilist}')
-print(f'  ndk:   {ndk or "(none)"}')
