@@ -129,7 +129,7 @@ jobs:
           echo "Chờ container thực sự vào trạng thái RUNNING (session start sẽ trigger việc này)..."
           STATE=""
           for i in $(seq 1 40); do
-            STATE=$(sudo waydroid status 2>/dev/null | grep -i "^Session" | awk '{print $NF}')
+            STATE=$(sudo waydroid status 2>/dev/null | grep -i "^Session:" | head -n1 | awk '{print $NF}')
             echo "  ($i/40) trạng thái session: ${STATE:-<chưa có>}"
             [ "$STATE" = "RUNNING" ] && break
             sleep 3
