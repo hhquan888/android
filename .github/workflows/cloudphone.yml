@@ -99,7 +99,23 @@ jobs:
           disown
           sleep 5
 
+          # Xác nhận Weston THỰC SỰ tạo được socket Wayland tại đúng chỗ
+          # Waydroid sẽ tìm ($XDG_RUNTIME_DIR/wayland-0) — đây là bằng chứng
+          # trực tiếp, không suy đoán qua log "Failed to get service ..." nữa.
+          echo "----- log weston -----"
+          cat /tmp/weston.log 2>/dev/null || true
+          echo "----- kiểm tra socket wayland-0 -----"
+          if [ -S "$XDG_RUNTIME_DIR/wayland-0" ]; then
+            echo "✅ Weston đã tạo socket $XDG_RUNTIME_DIR/wayland-0"
+          else
+            echo "::error::Weston KHÔNG tạo được socket wayland-0 tại $XDG_RUNTIME_DIR. Đây là nguyên nhân waydroidplatform không lên được ở bước sau."
+            ls -la "$XDG_RUNTIME_DIR" || true
+            ps aux | grep -i weston || true
+            exit 1
+          fi
+
       - name: Khởi động phiên Waydroid + bật ADB qua TCP
+        timeout-minutes: 10
         run: |
           eval "$(dbus-launch --sh-syntax)"
           echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"
@@ -163,7 +179,12 @@ jobs:
           sleep 3
           sudo waydroid status || true
 
-          waydroid prop set persist.waydroid.multi_windows false || true
+          # "waydroid prop set" gọi vào service "waydroidplatform" bên trong Android;
+          # nếu SurfaceFlinger/system server chưa lên kịp, lệnh này RETRY VÔ HẠN
+          # ("Failed to get service waydroidplatform, trying again...") và "|| true"
+          # không cứu được vì nó chỉ xử lý SAU khi lệnh return. Bọc timeout để không
+          # bao giờ treo — prop này chỉ là tùy chọn giao diện, bỏ qua cũng không sao.
+          timeout 20 waydroid prop set persist.waydroid.multi_windows false || echo "⚠️ Bỏ qua prop multi_windows (không quan trọng)"
           timeout 20 adb start-server || echo "⚠️ adb start-server timeout, tiếp tục thử"
 
           IP=""
