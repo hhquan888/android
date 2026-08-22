@@ -48,7 +48,7 @@ jobs:
       - name: Cài công cụ nền (adb, weston, tunnel deps)
         run: |
           sudo apt-get update
-          sudo apt-get install -y android-tools-adb curl weston xwayland lxc python3-pip ca-certificates
+          sudo apt-get install -y android-tools-adb curl weston xwayland lxc python3-pip ca-certificates dbus-x11
 
       - name: Cài Waydroid
         run: |
@@ -65,19 +65,26 @@ jobs:
       - name: Khởi động Weston headless (compositor host bắt buộc cho Waydroid)
         run: |
           export XDG_RUNTIME_DIR=/run/user/$(id -u)
-          sudo mkdir -p "$XDG_RUNTIME_DIR" && sudo chmod 700 "$XDG_RUNTIME_DIR"
+          sudo mkdir -p "$XDG_RUNTIME_DIR"
+          sudo chown "$(id -u):$(id -g)" "$XDG_RUNTIME_DIR"
+          chmod 700 "$XDG_RUNTIME_DIR"
+          echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
           weston --backend=headless-backend.so --width=720 --height=1280 --idle-time=0 &
           sleep 5
 
       - name: Khởi động phiên Waydroid + bật ADB qua TCP
         run: |
-          export XDG_RUNTIME_DIR=/run/user/$(id -u)
-          sudo waydroid session start &
+          eval "$(dbus-launch --sh-syntax)"
+          echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"
+
+          waydroid session start > /tmp/waydroid-session.log 2>&1 &
           sleep 15
-          sudo waydroid prop set persist.waydroid.multi_windows false || true
+          cat /tmp/waydroid-session.log
+
+          waydroid prop set persist.waydroid.multi_windows false || true
           adb start-server
           for i in $(seq 1 20); do
-            IP=$(sudo waydroid status 2>/dev/null | grep -i "IP address" | awk '{print $NF}')
+            IP=$(waydroid status 2>/dev/null | grep -i "IP address" | awk '{print $NF}')
             [ -n "$IP" ] && break
             sleep 3
           done
