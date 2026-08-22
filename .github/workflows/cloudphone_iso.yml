@@ -60,8 +60,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 qemu-utils ovmf \
             android-tools-adb curl unzip novnc websockify \
-            docker.io nodejs npm ca-certificates
+            nodejs npm ca-certificates
           sudo usermod -aG kvm "$USER" || true
+          sudo usermod -aG docker "$USER" || true
+          docker --version || { echo "::error::Docker không có sẵn trên runner - cần image khác hoặc cài docker-ce thủ công"; exit 1; }
 
       - name: Tải ISO Bliss OS (Android 10, x86_64) nếu chưa có trong cache
         run: |
