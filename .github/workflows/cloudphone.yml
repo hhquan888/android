@@ -126,26 +126,42 @@ jobs:
           nohup waydroid session start > /tmp/waydroid-session.log 2>&1 &
           disown
 
+          # Stream log thời gian thực để thấy container đang boot chứ không phải bị treo
+          tail -n +1 -f /tmp/waydroid-session.log &
+          TAIL_PID=$!
+
           echo "Chờ container thực sự vào trạng thái RUNNING (session start sẽ trigger việc này)..."
-          STATE=""
-          for i in $(seq 1 40); do
-            STATE=$(sudo waydroid status 2>/dev/null | grep -i "^Session:" | head -n1 | awk '{print $NF}')
-            echo "  ($i/40) trạng thái session: ${STATE:-<chưa có>}"
+          # QUAN TRỌNG: không dùng "waydroid status" để poll ở đây — nó phải đi qua
+          # DBus tới đúng service đang bận thực hiện việc boot (mount, lxc-start, retry),
+          # nên mỗi lần gọi sẽ bị XẾP HÀNG chờ tới khi thao tác boot xong mới trả lời,
+          # khiến việc poll tự làm chậm chính nó (mỗi lần gọi có thể mất 30-50s+).
+          # Dùng lxc-info trực tiếp: đọc thẳng trạng thái LXC cục bộ, không qua DBus,
+          # không bị nghẽn, phản hồi tức thì.
+          STATE="STOPPED"
+          for i in $(seq 1 60); do
+            STATE=$(sudo lxc-info -P /var/lib/waydroid/lxc -n waydroid -sH 2>/dev/null || echo "STOPPED")
+            echo "  ($i/60, ~$((i*5))s) trạng thái container (lxc-info): ${STATE:-<chưa có>}"
             [ "$STATE" = "RUNNING" ] && break
-            sleep 3
+            sleep 5
           done
 
-          echo "----- log waydroid-session -----"
+          kill "$TAIL_PID" 2>/dev/null || true
+          echo "----- log waydroid-session (đầy đủ tới thời điểm này) -----"
           cat /tmp/waydroid-session.log 2>/dev/null || true
 
           if [ "$STATE" != "RUNNING" ]; then
-            echo "::warning::Vẫn KHÔNG vào RUNNING sau ~120s. Chẩn đoán chi tiết:"
+            echo "::warning::Vẫn KHÔNG vào RUNNING sau ~5 phút. Chẩn đoán chi tiết:"
             sudo cat /var/lib/waydroid/waydroid.log 2>/dev/null || echo "(waydroid.log rỗng)"
             sudo journalctl -u waydroid-container --no-pager -n 100 2>/dev/null || true
             sudo lxc-info -P /var/lib/waydroid/lxc -n waydroid -sH 2>&1 || true
             sudo journalctl -k --no-pager 2>/dev/null | grep -iE "apparmor|denied|cgroup|binder|lxc" | tail -80 || true
             exit 1
           fi
+
+          # lxc-info RUNNING nghĩa là container Android đã lên; xác nhận thêm qua
+          # waydroid status (giờ DBus đã rảnh nên gọi sẽ nhanh) trước khi qua bước ADB.
+          sleep 3
+          sudo waydroid status || true
 
           waydroid prop set persist.waydroid.multi_windows false || true
           adb start-server
