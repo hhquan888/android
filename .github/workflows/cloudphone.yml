@@ -68,14 +68,25 @@ jobs:
           fi
 
           echo "Chờ container Waydroid vào trạng thái RUNNING..."
-          for i in $(seq 1 30); do
-            STATE=$(sudo waydroid status 2>/dev/null | grep -i "Session" | awk '{print $NF}')
-            echo "  ($i/30) trạng thái session: ${STATE:-<chưa có>}"
-            [ -n "$STATE" ] && break
+          STATE=""
+          for i in $(seq 1 40); do
+            STATE=$(sudo waydroid status 2>/dev/null | grep -i "^Session" | awk '{print $NF}')
+            echo "  ($i/40) trạng thái session: ${STATE:-<chưa có>}"
+            [ "$STATE" = "RUNNING" ] && break
             sleep 3
           done
-          echo "----- log waydroid-container (nếu có) -----"
-          cat /tmp/waydroid-container.log 2>/dev/null || true
+
+          if [ "$STATE" != "RUNNING" ]; then
+            echo "::warning::Container KHÔNG vào được trạng thái RUNNING sau ~120s. In log chẩn đoán:"
+            echo "----- journalctl waydroid-container -----"
+            sudo journalctl -u waydroid-container --no-pager -n 200 2>/dev/null || echo "(không có service systemd)"
+            echo "----- log waydroid-container.log (nếu chạy qua nohup) -----"
+            cat /tmp/waydroid-container.log 2>/dev/null || true
+            echo "----- lxc-info -----"
+            sudo lxc-info -n waydroid 2>&1 || true
+            echo "----- lxc container log file (nếu có) -----"
+            sudo find /var/lib/waydroid -iname "*.log" -exec echo "== {} ==" \; -exec sudo cat {} \; 2>/dev/null || true
+          fi
           sudo waydroid status || true
 
       - name: Khởi động Weston headless (compositor host bắt buộc cho Waydroid)
@@ -93,6 +104,12 @@ jobs:
         run: |
           eval "$(dbus-launch --sh-syntax)"
           echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"
+
+          CUR_STATE=$(sudo waydroid status 2>/dev/null | grep -i "^Session" | awk '{print $NF}')
+          if [ "$CUR_STATE" != "RUNNING" ]; then
+            echo "::error::Container chưa RUNNING (đang: ${CUR_STATE:-?}) — bỏ qua session start, xem log bước trước để chẩn đoán."
+            exit 1
+          fi
 
           nohup waydroid session start > /tmp/waydroid-session.log 2>&1 &
           disown
