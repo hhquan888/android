@@ -37,11 +37,13 @@ jobs:
           key: waydroid-data
           restore-keys: waydroid-data
 
-      - name: Kiểm tra binder/ashmem
+      - name: Cài module kernel binder/ashmem (linux-modules-extra)
         run: |
-          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder" || true
+          sudo apt-get update
+          sudo apt-get install -y linux-modules-extra-$(uname -r) || true
+          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder"
           sudo modprobe ashmem_linux || true
-          lsmod | grep -E "binder|ashmem" || echo "Có thể đã build sẵn vào kernel, không cần module rời"
+          lsmod | grep -E "binder|ashmem"
 
       - name: Cài công cụ nền (adb, weston, tunnel deps)
         run: |
@@ -98,6 +100,19 @@ jobs:
           adb -s "$WAYDROID_IP:5555" root || true
           sleep 3
           adb connect "$WAYDROID_IP:5555" || true
+
+      - name: Cài trình duyệt Brave (bản arm64 gốc, v1.93.132)
+        run: |
+          if adb -s "$WAYDROID_IP:5555" shell pm list packages | grep -qE "chrome|firefox|org.mozilla|brave|com.brave"; then
+            echo "✅ Đã có trình duyệt cài sẵn, bỏ qua."
+          else
+            echo "📥 Tải Brave APK bản arm64 gốc..."
+            BRAVE_URL="https://github.com/brave/brave-browser/releases/download/v1.93.132/Bravearm64Universal.apk"
+            curl -L "$BRAVE_URL" -o brave.apk
+            echo "sha256 file tải về: $(sha256sum brave.apk | awk '{print $1}')"
+            file brave.apk
+            adb -s "$WAYDROID_IP:5555" install -r brave.apk && echo "✅ Brave installed" || echo "⚠️ Cài thất bại, xem log ở trên."
+          fi
 
       # ---------------- VIEWER: scrcpy-web (ws-scrcpy) ----------------
       - name: "[scrcpy] Tải ws-scrcpy custom build sẵn"
