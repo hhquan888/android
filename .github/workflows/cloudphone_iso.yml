@@ -38,7 +38,13 @@ jobs:
       - name: Kiểm tra KVM (tăng tốc phần cứng cho QEMU)
         run: |
           if [ -e /dev/kvm ]; then
-            echo "✅ /dev/kvm tồn tại, sẽ chạy QEMU với -enable-kvm"
+            # usermod -aG kvm chỉ có hiệu lực ở session đăng nhập MỚI - job hiện tại
+            # kế thừa group list từ tiến trình runner đã khởi động TRƯỚC lệnh usermod,
+            # nên group membership không tự áp dụng giữa job. chmod thẳng device node
+            # là cách duy nhất có tác dụng ngay trong cùng job.
+            sudo chmod 666 /dev/kvm
+            ls -la /dev/kvm
+            echo "✅ /dev/kvm tồn tại và đã mở quyền, sẽ chạy QEMU với -enable-kvm"
             echo "KVM_OK=1" >> "$GITHUB_ENV"
           else
             echo "::warning::Không thấy /dev/kvm - QEMU sẽ chạy bằng TCG (phần mềm), Android sẽ boot RẤT chậm"
@@ -61,8 +67,8 @@ jobs:
           sudo apt-get install -y qemu-system-x86 qemu-utils ovmf \
             android-tools-adb curl unzip novnc websockify \
             nodejs npm ca-certificates
-          sudo usermod -aG kvm "$USER" || true
-          sudo usermod -aG docker "$USER" || true
+          # Runner mặc định đã có docker + user runner trong nhóm docker sẵn từ image,
+          # không cần usermod (usermod giữa job không có tác dụng - xem bước KVM ở trên)
           docker --version || { echo "::error::Docker không có sẵn trên runner - cần image khác hoặc cài docker-ce thủ công"; exit 1; }
 
       - name: Tải ISO Bliss OS (Android 10, x86_64) nếu chưa có trong cache
