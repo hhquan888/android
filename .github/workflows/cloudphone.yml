@@ -112,6 +112,17 @@ jobs:
             exit 1
           fi
 
+          # Waydroid cấu hình LXC bind-mount $XDG_RUNTIME_DIR/pulse/native vào container
+          # để forward audio. Runner headless không có PulseAudio/PipeWire session nào
+          # chạy thật (pipewire-pulse dù có sẵn cũng cần pipewire+wireplumber chạy trước,
+          # không đáng tin cậy trên CI) -> lxc-start fail ngay ở bước mount
+          # ("Failed to setup mount entries"). CloudPhone này chỉ cần điều khiển màn hình
+          # qua scrcpy-web/noVNC, không cần audio, nên chỉ cần tạo 1 file rỗng đúng path
+          # để bind-mount có nguồn hợp lệ mà không cần audio server thật nào cả.
+          export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+          mkdir -p "$XDG_RUNTIME_DIR/pulse"
+          touch "$XDG_RUNTIME_DIR/pulse/native"
+
           nohup waydroid session start > /tmp/waydroid-session.log 2>&1 &
           disown
 
