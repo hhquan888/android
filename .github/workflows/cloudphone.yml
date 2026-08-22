@@ -164,16 +164,24 @@ jobs:
           sudo waydroid status || true
 
           waydroid prop set persist.waydroid.multi_windows false || true
-          adb start-server
+          timeout 20 adb start-server || echo "⚠️ adb start-server timeout, tiếp tục thử"
+
+          IP=""
           for i in $(seq 1 20); do
-            IP=$(waydroid status 2>/dev/null | grep -i "IP address" | awk '{print $NF}')
-            [ -n "$IP" ] && break
+            CUR=$(timeout 10 waydroid status 2>/dev/null | grep -i "IP address" | awk '{print $NF}')
+            echo "  ($i/20) IP address hiện tại: ${CUR:-<chưa có>}"
+            # "UNKNOWN" nghĩa là Android chưa kịp DHCP xong, KHÔNG được coi là hợp lệ
+            if [ -n "$CUR" ] && [ "$CUR" != "UNKNOWN" ]; then
+              IP="$CUR"
+              break
+            fi
             sleep 3
           done
           IP="${IP:-192.168.240.112}"
+          echo "Dùng IP: $IP"
           echo "WAYDROID_IP=$IP" >> "$GITHUB_ENV"
-          adb connect "$IP:5555" || true
-          adb devices -l
+          timeout 15 adb connect "$IP:5555" || echo "⚠️ adb connect timeout/thất bại, xem lại bước sau"
+          timeout 15 adb devices -l || true
 
       - name: Chờ Android boot hoàn tất
         run: |
