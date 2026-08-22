@@ -66,45 +66,26 @@ jobs:
 
           echo "----- kiểm tra device node binder thực tế -----"
           ls -la /dev/binder /dev/hwbinder /dev/vndbinder 2>&1 || echo "⚠️ Thiếu device node binder (xem lsmod ở bước trước)"
-          ls -la /dev/binderfs 2>/dev/null || true
 
-          # Dùng restart (không phải enable --now) để đảm bảo tiến trình
-          # được khởi động lại sạch, kể cả khi service từng bị "active" dở dang
+          # LƯU Ý: waydroid-container.service chỉ ĐĂNG KÝ dịch vụ DBus
+          # "id.waydro.Container" rồi NGỒI CHỜ lệnh Start qua DBus.
+          # Nó KHÔNG tự boot Android, nên "waydroid status" ở đây sẽ luôn
+          # là Session: STOPPED cho tới khi "waydroid session start" (bước sau)
+          # thực sự gọi vào DBus để yêu cầu container khởi động.
+          # -> Ở bước này CHỈ cần đảm bảo service đang "active", KHÔNG chờ RUNNING.
           sudo systemctl enable waydroid-container 2>/dev/null || true
-          if sudo systemctl restart waydroid-container 2>/dev/null; then
-            echo "Container start/restart qua systemd service"
-          else
-            nohup sudo waydroid container start > /tmp/waydroid-container.log 2>&1 &
-            disown
-          fi
+          sudo systemctl restart waydroid-container 2>/dev/null || true
+          sleep 3
 
-          echo "Chờ container Waydroid vào trạng thái RUNNING..."
-          STATE=""
-          for i in $(seq 1 40); do
-            STATE=$(sudo waydroid status 2>/dev/null | grep -i "^Session" | awk '{print $NF}')
-            echo "  ($i/40) trạng thái session: ${STATE:-<chưa có>}"
-            [ "$STATE" = "RUNNING" ] && break
-            sleep 3
-          done
-
-          if [ "$STATE" != "RUNNING" ]; then
-            echo "::warning::Container KHÔNG vào được trạng thái RUNNING sau ~120s. In log chẩn đoán:"
-            echo "----- systemctl status (đầy đủ) -----"
+          if ! sudo systemctl is-active --quiet waydroid-container; then
+            echo "::warning::waydroid-container.service KHÔNG active. Chẩn đoán:"
             sudo systemctl status waydroid-container --no-pager -l --full 2>&1 || true
-            echo "----- journalctl waydroid-container (đầy đủ) -----"
-            sudo journalctl -u waydroid-container --no-pager -n 300 2>/dev/null || echo "(không có service systemd)"
-            echo "----- kernel log: apparmor / cgroup / binder -----"
+            sudo journalctl -u waydroid-container --no-pager -n 300 2>/dev/null || true
             sudo journalctl -k --no-pager 2>/dev/null | grep -iE "apparmor|denied|cgroup|binder|lxc" | tail -80 || true
-            echo "----- log waydroid-container.log (nếu chạy qua nohup) -----"
-            cat /tmp/waydroid-container.log 2>/dev/null || true
-            echo "----- lxc-info (đúng path Waydroid dùng) -----"
-            sudo lxc-info -P /var/lib/waydroid/lxc -n waydroid -sH 2>&1 || true
-            echo "----- lxc container log file (nếu có) -----"
-            sudo find /var/lib/waydroid -iname "*.log" -exec echo "== {} ==" \; -exec sudo cat {} \; 2>/dev/null || true
-            echo "----- Thử chạy foreground để bắt lỗi Python thật -----"
-            sudo systemctl stop waydroid-container 2>/dev/null || true
-            timeout 20 sudo waydroid container start 2>&1 || true
+            exit 1
           fi
+
+          echo "✅ waydroid-container.service đang active (container sẽ boot thật khi 'session start' được gọi ở bước sau)"
           sudo waydroid status || true
 
       - name: Khởi động Weston headless (compositor host bắt buộc cho Waydroid)
@@ -123,17 +104,37 @@ jobs:
           eval "$(dbus-launch --sh-syntax)"
           echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"
 
-          CUR_STATE=$(sudo waydroid status 2>/dev/null | grep -i "^Session" | awk '{print $NF}')
-          if [ "$CUR_STATE" != "RUNNING" ]; then
-            echo "::error::Container chưa RUNNING (đang: ${CUR_STATE:-?}) — bỏ qua session start, xem log bước trước để chẩn đoán."
+          # Điều kiện ĐÚNG để tiếp tục là service container đang active
+          # (KHÔNG phải Session==RUNNING — trạng thái đó chỉ có SAU khi
+          # session start thực sự gọi container khởi động qua DBus)
+          if ! sudo systemctl is-active --quiet waydroid-container; then
+            echo "::error::waydroid-container.service KHÔNG active — xem log bước trước để chẩn đoán."
             exit 1
           fi
 
           nohup waydroid session start > /tmp/waydroid-session.log 2>&1 &
           disown
-          sleep 20
+
+          echo "Chờ container thực sự vào trạng thái RUNNING (session start sẽ trigger việc này)..."
+          STATE=""
+          for i in $(seq 1 40); do
+            STATE=$(sudo waydroid status 2>/dev/null | grep -i "^Session" | awk '{print $NF}')
+            echo "  ($i/40) trạng thái session: ${STATE:-<chưa có>}"
+            [ "$STATE" = "RUNNING" ] && break
+            sleep 3
+          done
+
           echo "----- log waydroid-session -----"
-          cat /tmp/waydroid-session.log
+          cat /tmp/waydroid-session.log 2>/dev/null || true
+
+          if [ "$STATE" != "RUNNING" ]; then
+            echo "::warning::Vẫn KHÔNG vào RUNNING sau ~120s. Chẩn đoán chi tiết:"
+            sudo cat /var/lib/waydroid/waydroid.log 2>/dev/null || echo "(waydroid.log rỗng)"
+            sudo journalctl -u waydroid-container --no-pager -n 100 2>/dev/null || true
+            sudo lxc-info -P /var/lib/waydroid/lxc -n waydroid -sH 2>&1 || true
+            sudo journalctl -k --no-pager 2>/dev/null | grep -iE "apparmor|denied|cgroup|binder|lxc" | tail -80 || true
+            exit 1
+          fi
 
           waydroid prop set persist.waydroid.multi_windows false || true
           adb start-server
