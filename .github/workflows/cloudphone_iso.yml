@@ -1,0 +1,261 @@
+name: CloudPhone với QEMU x64 (Bliss OS Android 10 ISO)
+
+on:
+  workflow_dispatch:
+    inputs:
+      viewer:
+        description: 'Cách xem màn hình Android'
+        required: true
+        default: 'scrcpy'
+        type: choice
+        options:
+          - 'scrcpy'
+          - 'novnc'
+      iso_url:
+        description: 'Link ISO Bliss OS (Android 10, x86_64) - để trống dùng mặc định'
+        required: false
+        default: 'https://sourceforge.net/projects/blissos-dev/files/Android-Generic/PC/bliss/AG-10-Bliss-OS-android_x86_64-202010270916_k-kernel-5.8-si-next_m-20.1.0_pie-x86_dgc-cros-nb_gms_cros-wv.iso/download'
+      ram_mb:
+        description: 'RAM cấp cho VM (MB)'
+        required: true
+        default: '6144'
+      cpus:
+        description: 'Số lõi CPU cấp cho VM'
+        required: true
+        default: '4'
+      save_iso:
+        description: 'Cache ISO qua các lần chạy (đỡ tải lại)?'
+        required: true
+        default: 'y'
+        type: choice
+        options: ['y', 'n']
+
+jobs:
+  cloudphone:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    steps:
+      - name: Kiểm tra KVM (tăng tốc phần cứng cho QEMU)
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo "✅ /dev/kvm tồn tại, sẽ chạy QEMU với -enable-kvm"
+            echo "KVM_OK=1" >> "$GITHUB_ENV"
+          else
+            echo "::warning::Không thấy /dev/kvm - QEMU sẽ chạy bằng TCG (phần mềm), Android sẽ boot RẤT chậm"
+            echo "KVM_OK=0" >> "$GITHUB_ENV"
+          fi
+          echo "IMG_CACHE_DIR=$HOME/iso-cache" >> "$GITHUB_ENV"
+          mkdir -p "$HOME/iso-cache"
+
+      - name: Khôi phục ISO đã cache lần trước (nếu bật)
+        if: ${{ github.event.inputs.save_iso == 'y' }}
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.IMG_CACHE_DIR }}
+          key: blissos-iso-${{ github.event.inputs.iso_url }}
+          restore-keys: blissos-iso-
+
+      - name: Cài QEMU, websockify, adb, cloudflared deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils ovmf \
+            android-tools-adb curl unzip novnc websockify \
+            docker.io nodejs npm ca-certificates
+          sudo usermod -aG kvm "$USER" || true
+
+      - name: Tải ISO Bliss OS (Android 10, x86_64) nếu chưa có trong cache
+        run: |
+          ISO_URL="${{ github.event.inputs.iso_url }}"
+          ISO_PATH="$IMG_CACHE_DIR/blissos.iso"
+          echo "ISO_PATH=$ISO_PATH" >> "$GITHUB_ENV"
+
+          if [ -s "$ISO_PATH" ]; then
+            echo "✅ Đã có ISO trong cache ($(du -h "$ISO_PATH" | cut -f1)), bỏ qua tải lại"
+          else
+            echo "📥 Tải ISO từ: $ISO_URL"
+            # SourceForge redirect qua mirror, cần -L; retry vì mirror đôi khi rớt giữa chừng
+            for i in 1 2 3; do
+              curl -L --fail --retry 5 --retry-delay 5 -o "$ISO_PATH.part" "$ISO_URL" && break
+              echo "⚠️ Lần thử $i thất bại, thử lại..."
+              sleep 5
+            done
+            mv "$ISO_PATH.part" "$ISO_PATH"
+          fi
+
+          file "$ISO_PATH"
+          if ! file "$ISO_PATH" | grep -qi "ISO 9660\|UDF"; then
+            echo "::error::File tải về không phải ISO hợp lệ - kiểm tra lại iso_url"
+            exit 1
+          fi
+          echo "✅ ISO sẵn sàng tại $ISO_PATH ($(du -h "$ISO_PATH" | cut -f1))"
+
+      - name: Khởi động QEMU (Bliss OS live boot, mạng user-mode + hostfwd adb)
+        run: |
+          mkdir -p /tmp/qemu
+          MONITOR_SOCK=/tmp/qemu/monitor.sock
+          QMP_SOCK=/tmp/qemu/qmp.sock
+          echo "MONITOR_SOCK=$MONITOR_SOCK" >> "$GITHUB_ENV"
+
+          QEMU_ARGS=(
+            -name blissos-cloudphone
+            -m "${{ github.event.inputs.ram_mb }}"
+            -smp "${{ github.event.inputs.cpus }}"
+            -cdrom "$ISO_PATH"
+            -boot order=d
+            -vga virtio
+            -display none
+            -vnc 127.0.0.1:1
+            -netdev "user,id=net0,hostfwd=tcp::5555-:5555"
+            -device "e1000,netdev=net0"
+            -device usb-tablet
+            -rtc base=utc
+            -monitor "unix:${MONITOR_SOCK},server,nowait"
+            -qmp "unix:${QMP_SOCK},server,nowait"
+          )
+
+          if [ "$KVM_OK" = "1" ]; then
+            QEMU_ARGS=(-enable-kvm -cpu host "${QEMU_ARGS[@]}")
+          else
+            QEMU_ARGS=(-cpu max "${QEMU_ARGS[@]}")
+          fi
+
+          echo "▶️ qemu-system-x86_64 ${QEMU_ARGS[*]}"
+          nohup qemu-system-x86_64 "${QEMU_ARGS[@]}" > /tmp/qemu.log 2>&1 &
+          disown
+          echo "QEMU_PID=$!" >> "$GITHUB_ENV"
+
+          echo "⏳ Chờ QEMU mở cổng VNC (5901)..."
+          for i in $(seq 1 30); do
+            nc -z 127.0.0.1 5901 && echo "✅ Cổng VNC 5901 đã mở" && break
+            sleep 2
+            [ "$i" = "30" ] && { echo "::error::QEMU không mở được cổng VNC, xem log:"; cat /tmp/qemu.log; exit 1; }
+          done
+
+      - name: Chờ Android boot xong (poll qua ADB TCP forward)
+        timeout-minutes: 10
+        run: |
+          echo "⏳ Đợi Bliss OS boot (isolinux tự chọn 'Live' sau timeout, adbd cần bật thủ công trong Cài đặt lần đầu)..."
+          BOOTED=0
+          for i in $(seq 1 90); do
+            if timeout 3 adb connect 127.0.0.1:5555 > /tmp/adb.log 2>&1; then
+              STATE=$(timeout 3 adb -s 127.0.0.1:5555 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
+              if [ "$STATE" = "1" ]; then
+                echo "✅ Android đã boot xong và ADB TCP đã kết nối"
+                BOOTED=1
+                break
+              fi
+            fi
+            echo "  ($i/90, ~$((i*10))s) chưa sẵn sàng..."
+            sleep 10
+          done
+
+          if [ "$BOOTED" = "0" ]; then
+            echo "::warning::Chưa xác nhận được boot_completed qua ADB sau 15 phút."
+            echo "Nguyên nhân thường gặp: adbd chưa bật (cần vào Settings > Developer options > bật USB/Wireless debugging qua noVNC lần đầu)."
+            echo "VM vẫn đang chạy - dùng noVNC để vào Settings bật ADB, các bước sau sẽ tự retry kết nối."
+          fi
+
+      - name: "[novnc] Serve VNC framebuffer của QEMU qua websockify + noVNC web UI"
+        if: ${{ github.event.inputs.viewer == 'novnc' }}
+        run: |
+          nohup websockify --web=/usr/share/novnc/ 6080 127.0.0.1:5901 > /tmp/websockify.log 2>&1 &
+          disown
+          sleep 3
+          nc -z 127.0.0.1 6080 && echo "✅ noVNC web UI đang chạy tại cổng 6080" || { echo "::error::websockify không lên được cổng 6080"; cat /tmp/websockify.log; exit 1; }
+
+      - name: "[scrcpy] Tải ws-scrcpy custom build sẵn"
+        if: ${{ github.event.inputs.viewer == 'scrcpy' }}
+        run: |
+          mkdir -p ws-scrcpy-build
+          curl -L "https://github.com/hhquan888/ws-scrcpy/releases/download/1.0/ws-scrcpy-dist.zip" -o ws-scrcpy-dist.zip
+          unzip -o ws-scrcpy-dist.zip -d ws-scrcpy-build
+          cat > ws-scrcpy-build/Dockerfile <<'EOF'
+          FROM node:18-slim
+          RUN apt-get update && apt-get install -y android-tools-adb curl python3 make g++ && rm -rf /var/lib/apt/lists/*
+          WORKDIR /app
+          COPY . .
+          RUN npm install --omit=dev --no-audit --no-fund
+          EXPOSE 8000
+          CMD ["npm", "start"]
+          EOF
+
+      - name: "[scrcpy] Build & chạy ws-scrcpy (nối vào Bliss OS qua ADB TCP hostfwd :5555)"
+        if: ${{ github.event.inputs.viewer == 'scrcpy' }}
+        run: |
+          docker build -t custom-ws-scrcpy ./ws-scrcpy-build
+          docker run -d --name custom-ws-scrcpy --network host \
+            custom-ws-scrcpy \
+            sh -c "adb start-server && (for i in \$(seq 1 60); do adb connect 127.0.0.1:5555 && break; sleep 5; done) && npm start"
+          sleep 10
+          docker logs custom-ws-scrcpy | tail -n 50
+
+      - name: Vòng lặp tự retry adb connect (đề phòng adbd chỉ bật sau khi vào noVNC)
+        run: |
+          nohup bash -c '
+            while true; do
+              adb connect 127.0.0.1:5555 > /dev/null 2>&1
+              sleep 15
+            done
+          ' > /tmp/adb-watchdog.log 2>&1 &
+          disown
+
+      - name: Cài & chạy Cloudflare Tunnel (có watchdog)
+        run: |
+          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+          sudo mv cloudflared /usr/local/bin/
+          > cloudflared.log
+
+          if [ "${{ github.event.inputs.viewer }}" = "scrcpy" ]; then
+            MAIN_PORT=8000
+          else
+            MAIN_PORT=6080
+          fi
+          echo "MAIN_PORT=$MAIN_PORT" >> "$GITHUB_ENV"
+
+          nohup cloudflared tunnel --url "http://localhost:${MAIN_PORT}" >> cloudflared.log 2>&1 &
+          disown
+
+          for i in $(seq 1 20); do
+            sleep 3
+            URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cloudflared.log | head -n1 || true)
+            [ -n "$URL" ] && echo "TUNNEL_URL=$URL" >> "$GITHUB_ENV" && break
+          done
+
+          nohup bash -c "
+            while true; do
+              sleep 15
+              pgrep -f \"cloudflared tunnel --url http://localhost:${MAIN_PORT}\" > /dev/null || nohup cloudflared tunnel --url http://localhost:${MAIN_PORT} >> cloudflared.log 2>&1 &
+            done
+          " > cloudflared-watchdog.log 2>&1 &
+          disown
+
+      - name: In hướng dẫn sử dụng
+        run: |
+          echo "=========================================="
+          echo "📱 Viewer đang dùng: ${{ github.event.inputs.viewer }}"
+          if [ "${{ github.event.inputs.viewer }}" = "novnc" ]; then
+            echo "🖥  Truy cập: ${TUNNEL_URL}/vnc.html"
+          else
+            echo "🖥  Truy cập: ${TUNNEL_URL}"
+            echo "⚠️  scrcpy cần ADB debugging BẬT trong guest. Nếu ws-scrcpy không thấy device:"
+            echo "    1) Đổi viewer=novnc, chạy lại workflow để vào GUI"
+            echo "    2) Settings > System > Developer options > bật 'USB debugging'"
+            echo "    3) Chạy lại với viewer=scrcpy, watchdog adb sẽ tự connect trong <15s"
+          fi
+          echo "🔧 RAM: ${{ github.event.inputs.ram_mb }}MB | CPU: ${{ github.event.inputs.cpus }} lõi | KVM: ${KVM_OK}"
+          echo "🔧 ADB target: 127.0.0.1:5555 (hostfwd từ QEMU -netdev user)"
+          echo "=========================================="
+
+      - name: Giữ job chạy 340 phút
+        run: |
+          END=$((SECONDS + 340*60))
+          while [ $SECONDS -lt $END ]; do
+            sleep 60
+            if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+              echo "::error::QEMU đã thoát ngoài dự kiến, xem log:"
+              cat /tmp/qemu.log
+              exit 1
+            fi
+            echo "alive $(date)"
+          done
