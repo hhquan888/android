@@ -190,15 +190,50 @@ jobs:
           IP=""
           for i in $(seq 1 20); do
             CUR=$(timeout 10 waydroid status 2>/dev/null | grep -i "IP address" | awk '{print $NF}')
-            echo "  ($i/20) IP address hiện tại: ${CUR:-<chưa có>}"
-            # "UNKNOWN" nghĩa là Android chưa kịp DHCP xong, KHÔNG được coi là hợp lệ
+            echo "  ($i/20) IP address hiện tại (waydroid status): ${CUR:-<chưa có>}"
             if [ -n "$CUR" ] && [ "$CUR" != "UNKNOWN" ]; then
               IP="$CUR"
               break
             fi
+
+            # "waydroid status" báo UNKNOWN không có nghĩa là DHCP chưa xong —
+            # đọc thẳng file lease của dnsmasq (nguồn sự thật thật sự phía host,
+            # không phụ thuộc Android có báo cáo kịp hay không). Không đoán IP cố định.
+            for LEASEFILE in /var/lib/misc/dnsmasq.leases /var/lib/waydroid/dnsmasq.leases; do
+              if [ -f "$LEASEFILE" ]; then
+                LEASE_IP=$(sudo awk '{print $3}' "$LEASEFILE" 2>/dev/null | tail -n1)
+                [ -n "$LEASE_IP" ] && { IP="$LEASE_IP"; echo "  -> Lấy IP từ dnsmasq lease ($LEASEFILE): $IP"; break 2; }
+              fi
+            done
+
+            # Dự phòng thêm: hỏi bảng ARP/neighbor của host trên interface waydroid0
+            NEIGH_IP=$(ip neigh show dev waydroid0 2>/dev/null | awk '$0 !~ /FAILED|INCOMPLETE/ {print $1; exit}')
+            if [ -n "$NEIGH_IP" ]; then
+              IP="$NEIGH_IP"
+              echo "  -> Lấy IP từ ip neigh trên waydroid0: $IP"
+              break
+            fi
+
             sleep 3
           done
-          IP="${IP:-192.168.240.112}"
+
+          if [ -z "$IP" ]; then
+            echo "::warning::Không xác định được IP thật từ dnsmasq lease lẫn ip neigh. Không đoán IP cố định — thử scan cả dải mạng waydroid0."
+            for CAND in $(seq 2 20); do
+              CAND_IP="192.168.240.$CAND"
+              if timeout 1 bash -c "echo > /dev/tcp/$CAND_IP/5555" 2>/dev/null; then
+                IP="$CAND_IP"
+                echo "  -> Tìm thấy thiết bị mở cổng 5555 tại: $IP"
+                break
+              fi
+            done
+          fi
+
+          if [ -z "$IP" ]; then
+            echo "::error::Không tìm được IP thật của container Waydroid bằng bất kỳ cách nào. Không dùng IP đoán mò nữa."
+            exit 1
+          fi
+
           echo "Dùng IP: $IP"
           echo "WAYDROID_IP=$IP" >> "$GITHUB_ENV"
           timeout 15 adb connect "$IP:5555" || echo "⚠️ adb connect timeout/thất bại, xem lại bước sau"
